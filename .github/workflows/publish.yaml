@@ -29,4 +29,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
-          password: ${{ secrets.PYPI_TOKEN_GLOBAL }} # Use a standard name for clarity
+          password: ${{ secrets.PYPI_TOKEN_MCBRIDGE }} # Use a standard name for clarity
