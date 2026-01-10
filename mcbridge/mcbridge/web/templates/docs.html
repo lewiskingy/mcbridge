@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Minecraft Bridge - Wifi Redirector – Documentation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script defer src="{{ url_for('static', filename='js/theme.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='js/docs.js') }}"></script>
+</head>
+
+<body data-theme="dark">
+<header class="with-nav">
+  <nav class="nav-links">
+    <a href="{{ url_for('index_page') }}" class="button nav-btn">Home</a>
+    {% for doc in docs %}
+      <a href="{{ url_for('docs_page', doc=doc.slug) }}"
+         class="button nav-btn{% if doc.slug == active_doc %} active{% endif %}">
+        {{ doc.title }}
+      </a>
+    {% endfor %}
+  </nav>
+  <div class="actions">
+    <button class="secondary icon-btn" id="themeBtn" type="button">🌙</button>
+  </div>
+</header>
+
+<main class="doc-main">
+  <div class="doc-card">
+    <div id="doc" class="markdown loading" data-doc-slug="{{ active_doc or '' }}">
+      Loading documentation…
+    </div>
+  </div>
+</main>
+
+</body>
+</html>

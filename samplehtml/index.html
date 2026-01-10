@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>💎⛏️ Minecraft Bridge - Wifi Redirector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --bg-card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --accent: #4f46e5;
+      --border: #e5e7eb;
+      --terminal-bg: #0b1020;
+      --terminal-text: #d1d5db;
+
+      --ok: #16a34a;
+      --warn: #dc2626;
+    }
+
+    [data-theme="dark"] {
+      --bg: #0f172a;
+      --bg-card: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #818cf8;
+      --border: #1f2937;
+      --terminal-bg: #020617;
+      --terminal-text: #e5e7eb;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, var(--bg), #00000010);
+      color: var(--text);
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      font-size: 1.1rem;
+      margin: 0;
+      font-weight: 600;
+    }
+
+    button {
+      background: var(--accent);
+      border: none;
+      color: white;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+
+    button.secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    main {
+      padding: 1.5rem;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1rem;
+    }
+
+    a.button {
+      text-decoration: none;
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.7rem;
+      border-radius: 6px;
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .actions {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .label {
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .value {
+      font-size: 0.9rem;
+    }
+
+    .state {
+      font-weight: 600;
+    }
+
+    .state.running {
+      color: var(--ok);
+    }
+
+    .state.stopped {
+      color: var(--warn);
+    }
+
+    .terminal {
+      background: var(--terminal-bg);
+      color: var(--terminal-text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.8rem;
+      padding: 0.75rem;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      max-height: 300px;
+      overflow-y: auto;
+      border: 1px solid #00000030;
+    }
+
+    /* =========================
+   WORLD SELECTION (MODAL)
+   ========================= */
+  #worldList button {
+    text-align: left;
+  }
+
+  #worldList button.selected {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px
+      color-mix(in srgb, var(--accent), transparent 60%);
+  }
+
+
+    .icon-btn {
+      font-size: 1rem;
+      padding: 0.4rem 0.55rem;
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+  <h1>💎⛏️ Minecraft Bridge - Wifi Redirector ⛏️💎</h1>
+  <div style="display:flex; gap:0.5rem;">
+    <button class="secondary icon-btn" id="themeBtn" onclick="toggleTheme()">🌙</button>
+    <a href="/docs" class="button">Docs</a>
+    <button class="secondary" id="authBtn" onclick="authPrompt()">Sign on</button>
+  </div>
+</header>
+
+<main>
+  <!-- SERVER STATUS -->
+  <div class="card">
+    <h2>Server Status</h2>
+
+    <div class="actions">
+      <button onclick="refreshStatus()">Refresh</button>
+      <button id="startBtn" onclick="startWithWorld('bedrock')">Start</button>
+      <button id="stopBtn" onclick="stopServer('bedrock')">Stop</button>
+      <button class="secondary" onclick="openBroadcastModal()">Broadcast</button>
+    </div>
+
+    <div class="label">Active Server</div>
+    <div class="value" id="statusServer">—</div>
+
+    <div class="label">State</div>
+    <div class="value state" id="statusState">Unknown</div>
+
+    <div class="label">World</div>
+    <div class="value" id="statusWorld">—</div>
+
+    <div class="label">Players</div>
+    <div class="value" id="statusPlayers">—</div>
+
+    <div class="label">Player List</div>
+    <div class="value" id="statusPlayerList">—</div>
+
+    <div class="label">Allowlist</div>
+    <div class="value" id="statusAllowlistCount">—</div>
+
+    <div class="label">Allowed Players</div>
+    <div class="value" id="statusAllowlist">—</div>
+
+    <div class="label">Output</div>
+    <div id="output" class="terminal">Loading…</div>
+  </div>
+
+  <div class="card">
+    <!-- EVENTS -->
+    <h2>Events</h2>
+    <div class="label">World lifecycle</div>
+    <div id="events" style="max-height:220px; overflow:auto;"></div>
+
+    <hr style="border:none; border-top:1px solid var(--border); margin:0.75rem 0;">
+
+    <!-- LOGS -->
+    <h2>Logs</h2>
+    <div class="actions">
+      <button onclick="loadLog('control')">Control</button>
+      <button onclick="loadLog('backup')">Backup</button>
+      <button onclick="loadLog('cron')">Cron</button>
+      <button onclick="loadLog('players')">Players</button>
+    </div>
+    <div class="label">Log output</div>
+    <div id="logs" class="terminal">Select a log.</div>
+  </div>
+
+</main>
+
+<script>
+  let adminToken = sessionStorage.getItem("adminToken") || "";
+  let currentServer = null;
+  let selectedWorld = null;
+
+  function requireSignOn(message = "Please sign on to do this.") {
+    if (adminToken) return true;
+    alert(message);
+    return false;
+  }
+
+  /* =========================
+    THEME HANDLING
+    ========================= */
+
+  // Initialise theme
+  (function initTheme() {
+    const savedTheme = localStorage.getItem("theme") || "dark";
+    document.body.dataset.theme = savedTheme;
+    updateThemeIcon();
+  })();
+
+  function toggleTheme() {
+    const body = document.body;
+    const next = body.dataset.theme === "dark" ? "light" : "dark";
+    body.dataset.theme = next;
+    localStorage.setItem("theme", next);
+    updateThemeIcon();
+  }
+
+  function updateThemeIcon() {
+    const btn = document.getElementById("themeBtn");
+    if (!btn) return;
+
+    btn.textContent =
+      document.body.dataset.theme === "dark" ? "🌙" : "☀️";
+  }
+
+
+  /* =========================
+     AUTH
+     ========================= */
+  function authPrompt() {
+    const pwd = prompt("Admin password:");
+    if (!pwd) return;
+    adminToken = pwd;
+    sessionStorage.setItem("adminToken", adminToken);
+    authBtn.textContent = "Signed on";
+    authBtn.disabled = true;
+  }
+
+  /* =========================
+     STATUS RENDERING
+     ========================= */
+  function renderStatus(data) {
+    statusServer.textContent = data.server || "—";
+
+    statusState.textContent = data.running ? "Running" : "Stopped";
+    statusState.className =
+      "value state " + (data.running ? "running" : "stopped");
+
+    statusWorld.textContent = data.active_world || "—";
+    statusPlayers.textContent =
+      typeof data.player_count === "number" ? data.player_count : "—";
+
+    statusPlayerList.textContent =
+      Array.isArray(data.players) && data.players.length
+        ? data.players.join(", ")
+        : "—";
+
+    startBtn.disabled = data.running;
+    stopBtn.disabled = !data.running;
+  }
+
+  /* =========================
+     API
+     ========================= */
+
+  async function callApi(method, url) {
+    const isLogs = url.startsWith("/api/logs");
+    const target = isLogs ? logs : output;
+
+    target.textContent = "Running…";
+
+    const headers = adminToken ? { "X-Admin-Token": adminToken } : {};
+    const res = await fetch(url, { method, headers });
+
+    if (!res.ok) {
+      target.textContent = `Error ${res.status}`;
+      return;
+    }
+
+    // ---- LOGS: raw text only ----
+    if (isLogs) {
+      const text = await res.text();
+      target.textContent = text;
+      return;
+    }
+
+    // ---- EVERYTHING ELSE: JSON ----
+    const payload = await res.json();
+
+    if (payload.running !== undefined) {
+      renderStatus(payload);
+    }
+
+    target.textContent = JSON.stringify(payload, null, 2);
+  }
+
+  async function refreshStatus() {
+    await callApi("GET", "/api/servers/bedrock/status");
+    await refreshAllowlist();
+    refreshEvents();
+  }
+
+  async function refreshEvents() {
+    try {
+      const res = await fetch("/api/events");
+      const events = await res.json();
+      document.getElementById("events").innerHTML =
+        renderEventsTable(events);
+    } catch (e) {
+      document.getElementById("events").textContent = "Failed to load events";
+    }
+  }
+
+  async function refreshAllowlist() {
+    try {
+      const res = await fetch("/api/servers/bedrock/allowlist");
+      const raw = await res.json();
+
+      let payload = raw;
+      if (typeof raw.stdout === "string" && raw.stdout.trim().startsWith("{")) {
+        payload = JSON.parse(raw.stdout);
+      }
+
+      const players = payload.allowed_players || [];
+
+      statusAllowlistCount.textContent = `${players.length} allowed`;
+
+      statusAllowlist.textContent =
+        players.length
+          ? players.map(p => p.name).join(", ")
+          : "—";
+
+    } catch (e) {
+      statusAllowlistCount.textContent = "Error";
+      statusAllowlist.textContent = "—";
+    }
+  }
+
+  function loadLog(name) {
+    callApi("GET", `/api/logs/${name}`);
+  }
+
+  async function stopServer(server) {
+    if (!requireSignOn("Sign on to stop the server")) return;
+    await callApi("POST", `/api/servers/${server}/stop`);
+    await refreshStatus();
+  }
+
+  /* =========================
+     WORLD SELECTION
+     ========================= */
+  async function startWithWorld(server) {
+    if (!requireSignOn("Sign on to start the server")) return;
+
+    currentServer = server;
+    selectedWorld = null;
+
+    worldList.innerHTML = "Loading worlds…";
+    confirmWorldBtn.disabled = true;
+    worldModal.style.display = "flex";
+
+    const headers = adminToken ? { "X-Admin-Token": adminToken } : {};
+    const res = await fetch(`/api/servers/${server}/list`, { headers });
+
+    if (!res.ok) {
+      worldList.textContent = "Failed to load worlds";
+      return;
+    }
+
+    const data = await res.json();
+    const worlds = Array.isArray(data.worlds) ? data.worlds : [];
+
+    renderWorldList(worlds);
+  }
+
+  function renderWorldList(worlds) {
+    worldList.innerHTML = "";
+
+    worlds.forEach(world => {
+      const btn = document.createElement("button");
+      btn.className = "secondary";
+      btn.textContent = world;
+
+      btn.onclick = () => {
+        selectedWorld = world;
+        [...worldList.children].forEach(b => b.classList.remove("selected"));
+        btn.classList.add("selected");
+        confirmWorldBtn.disabled = false;
+      };
+
+      worldList.appendChild(btn);
+    });
+  }
+
+  async function confirmWorldStart() {
+    if (!selectedWorld || !currentServer) return;
+
+    worldModal.style.display = "none";
+
+    await callApi(
+      "POST",
+      `/api/servers/${currentServer}/start?world=${encodeURIComponent(selectedWorld)}`
+    );
+
+    await refreshStatus();
+  }
+
+  function closeWorldModal() {
+    worldModal.style.display = "none";
+  }
+    
+  /* =========================
+      EVENTS LOG
+      ========================= */
+
+  function formatTime(ts) {
+    if (!ts) return "—";
+    const d = new Date(ts);
+    return d.toLocaleString();
+  }
+
+  function renderEventsTable(events) {
+    if (!events.length) {
+      return "<div class='label'>No events</div>";
+    }
+
+    return `
+      <table style="width:100%; font-size:0.8rem; border-collapse:collapse;">
+        <thead>
+          <tr style="text-align:left; border-bottom:1px solid var(--border);">
+            <th>Time</th>
+            <th>Event</th>
+            <th>Server</th>
+            <th>World</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${events.map(e => `
+            <tr>
+              <td>${formatTime(e.timestamp)}</td>
+              <td>${e.event}</td>
+              <td>${e.data?.server ?? "—"}</td>
+              <td>${e.data?.world ?? "—"}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  async function loadEvents() {
+    logs.textContent = "Loading events…";
+
+    const res = await fetch("/api/events");
+    const events = await res.json();
+
+    if (!Array.isArray(events) || events.length === 0) {
+      logs.textContent = "No events found.";
+      return;
+    }
+
+    logs.innerHTML = renderEventsTable(events);
+  }
+
+  /* =========================
+      BROADCAST MODAL
+      ========================= */
+
+  function openBroadcastModal() {
+    if (!requireSignOn("Sign on to broadcast a message")) return;
+
+    broadcastMsg.value = "";
+    broadcastModal.style.display = "flex";
+
+    setTimeout(() => broadcastMsg.focus(), 50);
+  }
+
+  function closeBroadcastModal() {
+    broadcastModal.style.display = "none";
+  }
+
+  async function sendBroadcast() {
+    const msg = broadcastMsg.value.trim();
+    if (!msg) {
+      alert("Message cannot be empty");
+      return;
+    }
+
+    broadcastSendBtn.disabled = true;
+
+    try {
+      await callApi(
+        "POST",
+        `/api/servers/bedrock/broadcast?msg=${encodeURIComponent(msg)}`
+      );
+      closeBroadcastModal();
+      refreshStatus();
+    } finally {
+      broadcastSendBtn.disabled = false;
+    }
+  }
+
+  function broadcastKeyHandler(e) {
+    if (e.key === "Enter") {
+      // Shift+Enter → newline (default behaviour)
+      if (e.shiftKey) {
+        return;
+      }
+
+      // Enter → send
+      e.preventDefault();
+      sendBroadcast();
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", refreshStatus);
+</script>
+
+<div id="worldModal" style="display:none; position:fixed; inset:0; background:#00000080; align-items:center; justify-content:center;">
+  <div class="card" style="max-width:400px;">
+    <h2>Select world</h2>
+    <div id="worldList" style="display:flex; flex-direction:column; gap:0.5rem;"></div>
+    <div class="actions" style="justify-content:flex-end;">
+      <button class="secondary" onclick="closeWorldModal()">Cancel</button>
+      <button id="confirmWorldBtn" onclick="confirmWorldStart()" disabled>Start</button>
+    </div>
+  </div>
+</div>
+
+<div id="broadcastModal"
+     style="display:none; position:fixed; inset:0; background:#00000080;
+            align-items:center; justify-content:center; z-index:1000;">
+
+  <div class="card" style="max-width:420px; width:90%;">
+    <h2>Broadcast message</h2>
+
+    <div class="label">Message</div>
+    <textarea id="broadcastMsg"
+              rows="3"
+              style="width:100%; resize:none; padding:0.5rem;"
+              onkeydown="broadcastKeyHandler(event)"
+              placeholder="Type message… (Enter = send, Shift+Enter = new line)">
+    </textarea>
+
+    <div class="actions" style="justify-content:flex-end; margin-top:0.75rem;">
+      <button class="secondary" onclick="closeBroadcastModal()">Cancel</button>
+      <button id="broadcastSendBtn" onclick="sendBroadcast()">Send</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

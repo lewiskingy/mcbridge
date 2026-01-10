@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>💎⛏️ Minecraft Bridge - Wifi Redirector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  <script defer src="{{ url_for('static', filename='js/theme.js') }}"></script>
+  <script defer src="{{ url_for('static', filename='js/app.js') }}"></script>
+</head>
+
+<body data-theme="dark">
+<header class="with-nav">
+  <div class="header-main">
+    <h1>💎⛏️ Minecraft Bridge - Wifi Redirector ⛏️💎</h1>
+    <nav class="nav-links">
+      <a href="{{ url_for('index_page') }}" class="button nav-btn active">Home</a>
+      {% for doc in docs %}
+        <a href="{{ url_for('docs_page', doc=doc.slug) }}" class="button nav-btn">
+          {{ doc.title }}
+        </a>
+      {% endfor %}
+    </nav>
+  </div>
+  <div class="actions">
+    <button class="secondary icon-btn" id="themeBtn" type="button">🌙</button>
+  </div>
+</header>
+
+<main class="main-grid">
+  <div class="card">
+    <div class="card-header">
+      <h2>Access point</h2>
+      <div class="actions">
+        <span class="label">Status</span>
+        <div class="value state" id="apStatus">Loading…</div>
+        <button type="button" id="refreshApBtn">Refresh</button>
+      </div>
+    </div>
+
+    <div class="status-detail" id="apDriftSummary" hidden></div>
+    <div class="status-detail warning" id="apNatHint" hidden></div>
+
+    <div class="label">Access point</div>
+    <form id="apForm" class="form">
+      <label class="form-field">
+        <span class="label">SSID</span>
+        <input id="apSsidInput" type="text" name="ssid" placeholder="Network name">
+      </label>
+      <label class="form-field">
+        <span class="label">Password (empty for open)</span>
+        <div class="input-row">
+          <input id="apPasswordInput" type="password" name="password" placeholder="WPA2 passphrase">
+          <button type="button" class="secondary icon-btn" id="apPasswordToggle" aria-label="Show password">👁</button>
+        </div>
+      </label>
+      <div class="form-grid">
+        <label class="form-field">
+          <span class="label">Subnet octet</span>
+          <input id="apOctetInput" type="number" min="1" name="subnet_octet" placeholder="50">
+        </label>
+        <label class="form-field">
+          <span class="label">Channel</span>
+          <input id="apChannelInput" type="number" min="1" name="channel" placeholder="6">
+        </label>
+      </div>
+      <div class="actions end">
+        <span class="change-hint" id="apChangeHint">No changes</span>
+        <button type="submit" id="applyApBtn" disabled>Apply AP changes</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <h2>DNS overrides</h2>
+      <div class="actions">
+        <span class="label">Status</span>
+        <div class="value state" id="dnsStatus">Loading…</div>
+        <button type="button" id="refreshDnsBtn">Refresh</button>
+      </div>
+    </div>
+
+    <div class="status-detail" id="dnsDriftSummary" hidden></div>
+
+    <form id="dnsForm" class="form">
+      <label class="form-field">
+        <span class="label">Known servers</span>
+        <div class="input-row">
+          <select id="dnsKnownServers" name="known_server">
+            <option value="">Select a known server…</option>
+          </select>
+          <button type="button" class="secondary" id="refreshKnownServersBtn">Reload</button>
+        </div>
+      </label>
+      <label class="form-field">
+        <span class="label">Redirect hostname</span>
+        <input id="dnsRedirectInput" type="text" name="redirect" placeholder="play.example.com">
+      </label>
+      <label class="form-field">
+        <span class="label">Target</span>
+        <input id="dnsTargetInput" type="text" name="target" placeholder="192.168.50.5">
+      </label>
+      <div class="actions end">
+        <span class="change-hint" id="dnsChangeHint">No changes</span>
+        <button type="submit" id="applyDnsBtn" disabled>Apply DNS changes</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card card--full">
+    <div class="card-header">
+      <div class="stacked-heading">
+        <h2>Upstream networks</h2>
+        <p class="muted small">Manage the upstream Wi‑Fi networks that the bridge should use.</p>
+      </div>
+      <div class="actions">
+        <span class="label">Status</span>
+        <div class="value state" id="upstreamStatus">Loading…</div>
+        <button type="button" id="refreshUpstreamBtn">Refresh</button>
+        <button type="button" class="secondary" id="saveCurrentUpstreamBtn" disabled>Save current config</button>
+      </div>
+    </div>
+
+    <div class="status-detail warning" id="upstreamError" hidden></div>
+    <div class="status-detail" id="upstreamDrift" hidden></div>
+
+    <div class="upstream-grid">
+      <div class="scroll-area">
+        <table class="simple-table">
+          <thead>
+            <tr>
+              <th>SSID</th>
+              <th>Priority</th>
+              <th>Security</th>
+              <th>Availability</th>
+              <th>Signal</th>
+              <th>State</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="upstreamProfilesBody">
+            <tr>
+              <td colspan="7" class="muted">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <form id="upstreamForm" class="form">
+        <label class="form-field">
+          <span class="label">SSID</span>
+          <input id="upstreamSsidInput" type="text" name="upstream_ssid" placeholder="Home Wi-Fi">
+        </label>
+        <div class="form-grid">
+          <label class="form-field">
+            <span class="label">Security</span>
+            <select id="upstreamSecuritySelect" name="upstream_security">
+              <option value="wpa2">WPA2</option>
+              <option value="wpa3">WPA3</option>
+              <option value="open">Open</option>
+            </select>
+          </label>
+          <label class="form-field">
+            <span class="label">Passphrase</span>
+            <div class="input-row">
+              <input
+                id="upstreamPasswordInput"
+                type="password"
+                name="upstream_password"
+                placeholder="Passphrase"
+              >
+              <button type="button" class="secondary icon-btn" id="upstreamPasswordToggle" aria-label="Show password">👁</button>
+            </div>
+            <p class="muted note small">Passphrases are hashed; cannot display existing values.</p>
+          </label>
+          <label class="form-field">
+            <span class="label">Priority</span>
+            <input id="upstreamPriorityInput" type="number" min="1" name="priority" placeholder="10">
+            <p class="muted note">Higher priority networks will be tried first.</p>
+          </label>
+        </div>
+        <div class="actions end">
+          <button type="button" class="secondary" id="resetUpstreamBtn">Reset</button>
+          <button type="button" class="secondary danger" id="deleteUpstreamBtn" disabled>Delete</button>
+          <button type="submit" id="saveUpstreamBtn">Add network</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card card--full">
+    <h2>Command output</h2>
+    <div id="output" class="terminal">Loading…</div>
+  </div>
+</main>
+
+</body>
+</html>

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Minecraft Bridge - Wifi Redirector – Documentation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Markdown renderer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <style>
+    /* =========================
+       THEME VARIABLES (same as index)
+       ========================= */
+    :root {
+      --bg: #f4f6f8;
+      --bg-card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --accent: #4f46e5;
+      --border: #e5e7eb;
+      --code-bg: #f1f5f9;
+      --code-text: #0f172a;
+    }
+
+    [data-theme="dark"] {
+      --bg: #0f172a;
+      --bg-card: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #818cf8;
+      --border: #1f2937;
+      --code-bg: #020617;
+      --code-text: #e5e7eb;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, var(--bg), #00000010);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      font-size: 1.1rem;
+      margin: 0;
+      font-weight: 600;
+    }
+
+    a.button {
+      text-decoration: none;
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.7rem;
+      border-radius: 6px;
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    main {
+      padding: 2rem 1.5rem;
+      display: flex;
+      justify-content: center;
+    }
+
+    .doc-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 2rem;
+      max-width: 900px;
+      width: 100%;
+    }
+
+    /* =========================
+       MARKDOWN STYLES
+       ========================= */
+
+    .markdown h1 {
+      font-size: 1.8rem;
+      margin-top: 0;
+    }
+
+    .markdown h2 {
+      font-size: 1.4rem;
+      margin-top: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.3rem;
+    }
+
+    .markdown h3 {
+      font-size: 1.1rem;
+      margin-top: 1.5rem;
+    }
+
+    .markdown p {
+      margin: 0.8rem 0;
+    }
+
+    .markdown ul,
+    .markdown ol {
+      padding-left: 1.5rem;
+      margin: 0.8rem 0;
+    }
+
+    .markdown li {
+      margin: 0.3rem 0;
+    }
+
+    .markdown a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 500;
+    }
+
+    .markdown a:hover {
+      text-decoration: underline;
+    }
+
+    .markdown code {
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 0.15rem 0.35rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .markdown pre {
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 1rem;
+      border-radius: 10px;
+      overflow-x: auto;
+      font-size: 0.85rem;
+      border: 1px solid var(--border);
+    }
+
+    .markdown pre code {
+      background: none;
+      padding: 0;
+    }
+
+    .markdown blockquote {
+      margin: 1.2rem 0;
+      padding-left: 1rem;
+      border-left: 4px solid var(--accent);
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    .markdown hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 2rem 0;
+    }
+
+    .markdown table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.2rem 0;
+      font-size: 0.9rem;
+    }
+
+    .markdown th,
+    .markdown td {
+      border: 1px solid var(--border);
+      padding: 0.5rem 0.7rem;
+      text-align: left;
+    }
+
+    .markdown th {
+      background: color-mix(in srgb, var(--bg-card), var(--accent) 6%);
+      font-weight: 600;
+    }
+
+    .loading {
+      color: var(--muted);
+      font-style: italic;
+    }
+  </style>
+</head>
+
+<body data-theme="dark">
+
+<header>
+  <h1>Documentation</h1>
+  <a href="/" class="button">← Back to console</a>
+</header>
+
+<main>
+  <div class="doc-card">
+    <div id="doc" class="markdown loading">
+      Loading documentation…
+    </div>
+  </div>
+</main>
+
+<script>
+  // Load Overview.md at runtime and render markdown
+  fetch("/static/docs/Overview.md")
+    .then(r => {
+      if (!r.ok) throw new Error("Failed to load Overview.md");
+      return r.text();
+    })
+    .then(md => {
+      document.getElementById("doc").innerHTML = marked.parse(md);
+      document.getElementById("doc").classList.remove("loading");
+    })
+    .catch(err => {
+      document.getElementById("doc").textContent = err.toString();
+    });
+</script>
+
+</body>
+</html>

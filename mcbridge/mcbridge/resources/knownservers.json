@@ -1,0 +1,17 @@
+{
+  "target": "example.ddns.com",
+  "redirects": [
+    {
+      "name": "Enchanted",
+      "redirect": "play.enchanted.gg"
+    },
+    {
+      "name": "Cubecraft",
+      "redirect": "play.cubecraft.net"
+    },
+    {
+      "name": "Lifeboat",
+      "redirect": "mco.lbsg.net"
+    }
+  ]
+}

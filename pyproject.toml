@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcbridge"
+version = "0.1.1"
+description = "Lightweight Minecraft Wi-Fi bridge appliance with AP and DNS management"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{ name = "mcbridge maintainers" }]
+dependencies = ["Flask>=2.3"]
+
+[project.scripts]
+mcbridge = "mcbridge.cli:main"
+mcbridge-web = "mcbridge.web:main"
+mcbridge-agent-socket-helper = "mcbridge.socket_helper:main"
+
+[tool.setuptools.packages.find]
+where = ["mcbridge"]
+
+[tool.setuptools.package-data]
+"mcbridge.resources" = ["provision.sh", "knownservers.json"]
+"mcbridge.web" = [
+  "templates/*.html",
+  "static/css/*.css",
+  "static/js/*.js",
+  "static/docs/*.md",
+]
