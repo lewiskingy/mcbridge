@@ -63,6 +63,11 @@ Outputs include JSON on stdout and human-readable logs on stderr. The CLI restar
 - Add or edit upstream networks from the web UI or `/upstream` API endpoints using a single password field.
 - The upstream password input accepts either a normal passphrase or a 64-character hexadecimal PSK. PSKs are stored exactly as entered, while other passwords are hashed with the SSID before being saved to `upstream_networks.json`.
 
+## Upstream DNS handling
+- Upstream DNS servers are discovered from the active upstream DHCP lease and injected into the rendered `dnsmasq` configuration.
+- There is no CLI or config override for upstream DNS; mcbridge always uses the DHCP-provided servers.
+- When the upstream Wi‑Fi connection changes (new SSID, reconnect, DHCP renew), mcbridge regenerates and restarts `dnsmasq` to apply the updated DNS servers.
+
 knownservers.json is now a **single object** with a default `target` and a `redirects` array of menu entries. Each entry should include a friendly `name` and the `redirect` hostname, with optional per-entry `target` overrides. Example:
 ```json
 {

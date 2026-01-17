@@ -127,8 +127,8 @@ dhcp-option=3,192.168.50.1     # gateway
 dhcp-option=6,192.168.50.1     # DNS
 
 # Upstream DNS
-server=1.1.1.1
-server=8.8.8.8
+# mcbridge discovers upstream DNS from the active upstream DHCP lease and
+# injects the servers into dnsmasq automatically (no manual server= entries).
 
 # --- DNS overrides ---
 # Example: cubecraft.net -> example.ddns.com

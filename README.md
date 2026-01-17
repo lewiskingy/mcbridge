@@ -149,6 +149,11 @@ Operators looking for the full provisioning flow can read the consolidated guide
 - **systemd units**: manage AP interface creation, hostapd/dnsmasq lifecycles, and persistent firewall rules so the bridge survives reboots.
 - **Web console**: Flask server installed by default during `mcbridge init` (unless you pass `--no-web`) that calls the AP/DNS/init domain functions in-process (no sudo/subprocess hop) with an opt-in CLI subprocess fallback (`MCBRIDGE_WEB_USE_SUBPROCESS=1` or `--subprocess-runner` when launching). TLS cert/key and a shared token/password can be supplied via environment variables or `/etc/mcbridge/config/web.json`. When both cert and key are present, the server binds HTTPS; otherwise, it falls back to HTTP. The systemd unit still runs as `MCBRIDGE_WEB_USER`/`MCBRIDGE_WEB_GROUP` (defaults `admin`) so you can continue using the admin/install user if it already owns the mcbridge config and systemd files.
 
+### Upstream DNS handling
+- Upstream DNS servers are derived from the active upstream Wi‑Fi DHCP lease and injected into the generated `dnsmasq` configuration automatically.
+- No CLI flag or config file override exists for upstream DNS—only the DHCP-provided values are used.
+- When the upstream Wi‑Fi connection changes (new SSID, reconnect, DHCP renew), mcbridge regenerates and restarts `dnsmasq` to apply the updated DNS servers.
+
 ## Setup and usage
 
 - Installation and base network setup: see [docs/INSTALL.md](docs/INSTALL.md).
