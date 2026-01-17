@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any, Callable, Sequence
 
-from . import agent, ap, dns, init, upstream
+from . import agent, ap, dns, init, upstream, upstream_dns
 
 LOG = logging.getLogger(__name__)
 
@@ -22,6 +22,16 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value} is not a valid integer") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("Value must be positive")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:  # pragma: no cover - argparse maps to SystemExit
+        raise argparse.ArgumentTypeError(f"{value} is not a valid integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be zero or positive")
     return parsed
 
 
@@ -148,6 +158,22 @@ def _build_parser() -> argparse.ArgumentParser:
     upstream_forget = upstream_sub.add_parser("forget", help="Forget an upstream Wi-Fi connection")
     upstream_forget.add_argument("--ssid", required=True, help="SSID to forget")
     upstream_forget.add_argument("--interface", help="Network interface used for active connection checks")
+    upstream_dns_refresh = upstream_sub.add_parser(
+        "dns-refresh", help="Discover upstream DNS and optionally apply updates"
+    )
+    upstream_dns_refresh.add_argument("--interface", help="Interface to inspect for DNS servers")
+    upstream_dns_refresh.add_argument(
+        "--debounce-seconds",
+        type=_non_negative_int,
+        default=upstream_dns.DEBOUNCE_SECONDS,
+        help="Seconds to debounce repeat refresh requests (default: %(default)s)",
+    )
+    upstream_dns_refresh.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply updated dnsmasq configuration if upstream DNS changes",
+    )
+    upstream_dns_refresh.add_argument("--debug-json", action="store_true", help="Emit full JSON payload")
 
     return parser
 
@@ -201,6 +227,15 @@ def _handle_upstream_activate(args: argparse.Namespace) -> upstream.UpstreamResu
 
 def _handle_upstream_forget(args: argparse.Namespace) -> upstream.UpstreamResult:
     return upstream.forget_system_profile(ssid=args.ssid, interface=args.interface)
+
+
+def _handle_upstream_dns_refresh(args: argparse.Namespace) -> upstream_dns.UpstreamDnsResult:
+    return upstream_dns.refresh_upstream_dns(
+        interface=args.interface,
+        debounce_seconds=args.debounce_seconds,
+        apply=args.apply,
+        debug_json=args.debug_json,
+    )
 
 
 def _handle_init(args: argparse.Namespace) -> init.InitResult:
@@ -263,6 +298,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         exit_code = _run(_handle_upstream_activate, args)
     elif args.domain == "upstream" and args.action == "forget":
         exit_code = _run(_handle_upstream_forget, args)
+    elif args.domain == "upstream" and args.action == "dns-refresh":
+        exit_code = _run(_handle_upstream_dns_refresh, args)
     else:  # pragma: no cover - argparse enforces choices
         parser.error("Unsupported command")
         return

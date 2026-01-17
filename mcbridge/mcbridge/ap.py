@@ -66,7 +66,7 @@ from .common import (
     service_status,
     write_history_file,
 )
-from . import privileges, upstream
+from . import privileges, upstream, upstream_dns
 from .paths import GENERATED_DIR
 from .service_enablement import ensure_services_enabled
 
@@ -876,6 +876,9 @@ def _hostapd_template(config: Mapping[str, object]) -> str:
 
 
 def _resolve_upstream_servers() -> list[str]:
+    persisted = upstream_dns.load_upstream_dns()
+    if persisted.servers:
+        return persisted.servers
     for resolv_path in UPSTREAM_DHCP_RESOLV_PATHS:
         contents = read_text(resolv_path)
         if not contents:
@@ -986,8 +989,8 @@ def _ap_section_body(config: Mapping[str, object], *, upstream_servers: Sequence
     if not upstream_servers:
         resolv_paths = ", ".join(str(path) for path in UPSTREAM_DHCP_RESOLV_PATHS)
         raise ValueError(
-            "No upstream DNS servers detected from DHCP-derived resolv.conf data. "
-            f"Checked {resolv_paths}; connect the upstream interface and retry."
+            "No upstream DNS servers detected in upstream DNS cache or DHCP-derived resolv.conf data. "
+            f"Checked {upstream_dns.UPSTREAM_DNS_JSON} and {resolv_paths}; connect the upstream interface and retry."
         )
 
     lines = [
