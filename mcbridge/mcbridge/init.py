@@ -24,7 +24,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Mapping, Sequence
 
-from . import agent, ap, dns
+from . import agent, ap, dns, upstream_dns
 from .common import (
     AP_JSON,
     CONFIG_DIR,
@@ -2271,6 +2271,9 @@ def run(
             payload_sections.append({"dns_update": dns_result.payload})
         else:
             payload_sections.append({"dns_update": {"skipped": True, "reason": "no_redirect_target"}})
+
+        upstream_dns_result = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
+        payload_sections.append({"upstream_dns_refresh": upstream_dns_result.payload})
 
         ap_result = ap.update(
             ssid=ssid,

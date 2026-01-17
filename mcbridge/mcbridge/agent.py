@@ -538,6 +538,33 @@ def _domain_upstream_forget(command: Sequence[str], *, text_mode: bool) -> Mappi
     }
 
 
+def _domain_upstream_dns_refresh(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
+    from . import upstream_dns
+
+    parser = _ArgumentParser(prog="mcbridge upstream dns-refresh", add_help=False)
+    parser.add_argument("--interface")
+    parser.add_argument("--debounce-seconds", dest="debounce_seconds", type=int)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--debug-json", dest="debug_json", action="store_true")
+    try:
+        parsed = parser.parse_args(command[3:])
+    except ValueError as exc:
+        return {"status": "ok", "returncode": 2, "stdout": "", "stderr": str(exc)}
+
+    result = upstream_dns.refresh_upstream_dns(
+        interface=parsed.interface,
+        debounce_seconds=parsed.debounce_seconds,
+        apply=parsed.apply,
+        debug_json=parsed.debug_json,
+    )
+    return {
+        "status": "ok",
+        "returncode": result.exit_code,
+        "stdout": _serialize_payload(result.payload, text_mode=text_mode),
+        "stderr": "",
+    }
+
+
 DOMAIN_ALLOWLIST = {
     ("dns", "status"): _domain_dns_status,
     ("dns", "update"): _domain_dns_update,
@@ -546,6 +573,7 @@ DOMAIN_ALLOWLIST = {
     ("upstream", "apply"): _domain_upstream_apply,
     ("upstream", "activate"): _domain_upstream_activate,
     ("upstream", "forget"): _domain_upstream_forget,
+    ("upstream", "dns-refresh"): _domain_upstream_dns_refresh,
 }
 
 

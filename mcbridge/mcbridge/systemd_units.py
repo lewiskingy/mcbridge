@@ -10,6 +10,7 @@ AP_INTERFACE = os.environ.get("MCBRIDGE_AP_INTERFACE", "wlan0ap")
 UPSTREAM_INTERFACE = os.environ.get("MCBRIDGE_UPSTREAM_INTERFACE", "wlan0")
 WLAN0AP_UNIT = "wlan0ap.service"
 WLAN0AP_IP_UNIT = "wlan0ap-ip.service"
+UPSTREAM_DNS_REFRESH_UNIT = "mcbridge-upstream-dns-refresh.service"
 
 
 def _normalize_cidr(value: str) -> str:
@@ -78,6 +79,34 @@ def wlan0ap_ip_service_template(
     return "\n".join(lines) + "\n"
 
 
+def upstream_dns_refresh_service_template(
+    *,
+    upstream_interface: str,
+    debounce_seconds: int = 10,
+    service_user: str = "root",
+    service_group: str = "root",
+) -> str:
+    lines = [
+        "[Unit]",
+        "Description=Refresh upstream DNS for mcbridge",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        f"User={service_user}",
+        f"Group={service_group}",
+        "NoNewPrivileges=yes",
+        "Environment=PATH=/usr/local/bin:/usr/bin:/bin",
+        f"Environment=MCBRIDGE_UPSTREAM_INTERFACE={upstream_interface}",
+        f"ExecStart=/usr/bin/env mcbridge upstream dns-refresh --apply --debounce-seconds {debounce_seconds}",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _write_output(contents: str, output: str | None) -> None:
     if not output:
         print(contents, end="")
@@ -101,6 +130,15 @@ def _build_parser() -> argparse.ArgumentParser:
     wlan0ap_ip.add_argument("--ap-ip-cidr", required=True)
     wlan0ap_ip.add_argument("--ap-service-unit", default=WLAN0AP_UNIT)
     wlan0ap_ip.add_argument("--output")
+
+    upstream_dns_refresh = subparsers.add_parser(
+        "upstream-dns-refresh", help="Render mcbridge-upstream-dns-refresh.service"
+    )
+    upstream_dns_refresh.add_argument("--upstream-interface", default=UPSTREAM_INTERFACE)
+    upstream_dns_refresh.add_argument("--debounce-seconds", type=int, default=10)
+    upstream_dns_refresh.add_argument("--service-user", default="root")
+    upstream_dns_refresh.add_argument("--service-group", default="root")
+    upstream_dns_refresh.add_argument("--output")
     return parser
 
 
@@ -113,6 +151,13 @@ def _main(argv: list[str] | None = None) -> int:
     elif args.unit == "wlan0ap-ip":
         contents = wlan0ap_ip_service_template(
             ap_interface=args.ap_interface, ap_ip_cidr=args.ap_ip_cidr, ap_service_unit=args.ap_service_unit
+        )
+    elif args.unit == "upstream-dns-refresh":
+        contents = upstream_dns_refresh_service_template(
+            upstream_interface=args.upstream_interface,
+            debounce_seconds=args.debounce_seconds,
+            service_user=args.service_user,
+            service_group=args.service_group,
         )
     else:
         parser.error(f"Unknown unit: {args.unit}")

@@ -19,6 +19,9 @@ Required/optional arguments:
   --upstream-interface <name>   Upstream interface for NAT (default: wlan0)
   --ap-service-path <path>      Destination for wlan0ap.service (default: /etc/systemd/system/wlan0ap.service)
   --ap-ip-service-path <path>   Destination for wlan0ap-ip.service (default: /etc/systemd/system/wlan0ap-ip.service)
+  --upstream-dns-service-path <path>
+                                Destination for mcbridge-upstream-dns-refresh.service (default: /etc/systemd/system/mcbridge-upstream-dns-refresh.service)
+  --nm-dispatcher-path <path>   Destination for NetworkManager dispatcher script (default: /etc/NetworkManager/dispatcher.d/90-mcbridge-upstream-dns)
   --ap-ip-cidr <cidr>           IP (CIDR) assigned to the AP interface; enables wlan0ap-ip.service when set
   --sysctl-conf-path <path>     Path for persistent sysctl config (default: /etc/sysctl.d/99-mcbridge.conf)
   --iptables-rules-path <path>  Path for iptables-save output (default: /etc/iptables/rules.v4)
@@ -31,6 +34,8 @@ Required/optional arguments:
   --dnsmasq-template <path>     Path to a dnsmasq.conf template to apply instead of rendering
   --unit-wlan0ap <path>         Path to an existing wlan0ap.service unit file to install instead of rendering
   --unit-wlan0ap-ip <path>      Path to an existing wlan0ap-ip.service unit file to install instead of rendering
+  --unit-upstream-dns-refresh <path>
+                                Path to an existing mcbridge-upstream-dns-refresh.service unit file to install instead of rendering
   --force                       Re-run provisioning even if all preflight checks pass
 EOF
 }
@@ -48,11 +53,15 @@ AP_INTERFACE="wlan0ap"
 UPSTREAM_INTERFACE="wlan0"
 AP_SERVICE_PATH="/etc/systemd/system/wlan0ap.service"
 AP_IP_SERVICE_PATH="/etc/systemd/system/wlan0ap-ip.service"
+UPSTREAM_DNS_SERVICE_PATH="${MCBRIDGE_UPSTREAM_DNS_SERVICE:-/etc/systemd/system/mcbridge-upstream-dns-refresh.service}"
+NM_DISPATCHER_PATH="${MCBRIDGE_NM_DISPATCHER_PATH:-/etc/NetworkManager/dispatcher.d/90-mcbridge-upstream-dns}"
+UPSTREAM_DNS_DEBOUNCE_SECONDS="${MCBRIDGE_DNS_DEBOUNCE_SECONDS:-10}"
 AP_IP_CIDR=""
 HOSTAPD_TEMPLATE_PATH="${MCBRIDGE_HOSTAPD_TEMPLATE:-}"
 DNSMASQ_TEMPLATE_PATH="${MCBRIDGE_DNSMASQ_TEMPLATE:-}"
 WLAN0AP_UNIT_SOURCE="${MCBRIDGE_UNIT_WLAN0AP:-}"
 WLAN0AP_IP_UNIT_SOURCE="${MCBRIDGE_UNIT_WLAN0AP_IP:-}"
+UPSTREAM_DNS_UNIT_SOURCE="${MCBRIDGE_UNIT_UPSTREAM_DNS_REFRESH:-}"
 SYSCTL_CONF_PATH="/etc/sysctl.d/99-mcbridge.conf"
 IPTABLES_RULES_V4="/etc/iptables/rules.v4"
 ETC_DIR="${MCBRIDGE_ETC_DIR:-/etc/mcbridge}"
@@ -157,6 +166,14 @@ while [[ $# -gt 0 ]]; do
       AP_IP_SERVICE_PATH="$2"
       shift 2
       ;;
+    --upstream-dns-service-path)
+      UPSTREAM_DNS_SERVICE_PATH="$2"
+      shift 2
+      ;;
+    --nm-dispatcher-path)
+      NM_DISPATCHER_PATH="$2"
+      shift 2
+      ;;
     --ap-ip-cidr)
       AP_IP_CIDR="$2"
       shift 2
@@ -203,6 +220,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --unit-wlan0ap-ip)
       WLAN0AP_IP_UNIT_SOURCE="$2"
+      shift 2
+      ;;
+    --unit-upstream-dns-refresh)
+      UPSTREAM_DNS_UNIT_SOURCE="$2"
       shift 2
       ;;
     --force)
@@ -454,6 +475,8 @@ run_preflight_checks() {
   else
     log "AP IP CIDR not provided; skipping wlan0ap-ip.service presence check"
   fi
+  check_file_present "${UPSTREAM_DNS_SERVICE_PATH}" "systemd unit" || issues+=("unit:${UPSTREAM_DNS_SERVICE_PATH}")
+  check_file_present "${NM_DISPATCHER_PATH}" "NetworkManager dispatcher" || issues+=("dispatcher:${NM_DISPATCHER_PATH}")
 
   check_file_present "/etc/hostapd/hostapd.conf" "hostapd configuration" || issues+=("config:/etc/hostapd/hostapd.conf")
   check_file_present "/etc/dnsmasq.conf" "dnsmasq configuration" || issues+=("config:/etc/dnsmasq.conf")
@@ -736,6 +759,12 @@ write_unit() {
   install -Dm644 /dev/stdin "${path}"
 }
 
+write_dispatcher() {
+  local path="$1"
+  log "Writing NetworkManager dispatcher to ${path}"
+  install -Dm755 /dev/stdin "${path}"
+}
+
 write_drop_in() {
   local path="$1"
   log "Writing systemd drop-in to ${path}"
@@ -764,6 +793,27 @@ install_unit_from_source_or_render() {
   else
     render_unit "${unit}" "${render_args[@]}" | write_unit "${dest}"
   fi
+}
+
+install_nm_dispatcher() {
+  write_dispatcher "${NM_DISPATCHER_PATH}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+interface="${1:-}"
+action="${2:-}"
+upstream_interface="${MCBRIDGE_UPSTREAM_INTERFACE:-wlan0}"
+
+if [[ -z "${interface}" ]] || [[ "${interface}" != "${upstream_interface}" ]]; then
+  exit 0
+fi
+
+case "${action}" in
+  up|dhcp4-change|dhcp6-change|connectivity-change)
+    systemctl start mcbridge-upstream-dns-refresh.service
+    ;;
+esac
+EOF
 }
 
 ensure_unit_unmasked() {
@@ -1168,6 +1218,15 @@ if [[ -n "${AP_IP_CIDR}" ]]; then
   log "Dropping wlan0ap-ip.service to ${AP_IP_SERVICE_PATH} for ${AP_IP_CIDR}"
   install_unit_from_source_or_render "${WLAN0AP_IP_UNIT_SOURCE}" "${AP_IP_SERVICE_PATH}" wlan0ap-ip --ap-interface "${AP_INTERFACE}" --ap-ip-cidr "${AP_IP_CIDR}" --ap-service-unit "${AP_SERVICE_PATH##*/}"
 fi
+
+log "Dropping mcbridge-upstream-dns-refresh.service to ${UPSTREAM_DNS_SERVICE_PATH}"
+install_unit_from_source_or_render \
+  "${UPSTREAM_DNS_UNIT_SOURCE}" \
+  "${UPSTREAM_DNS_SERVICE_PATH}" \
+  upstream-dns-refresh \
+  --upstream-interface "${UPSTREAM_INTERFACE}" \
+  --debounce-seconds "${UPSTREAM_DNS_DEBOUNCE_SECONDS}"
+install_nm_dispatcher
 
 ensure_service_depends_on_ap hostapd.service
 ensure_service_depends_on_ap dnsmasq.service
