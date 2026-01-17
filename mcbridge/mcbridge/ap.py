@@ -8,6 +8,7 @@ stderr available for logs.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -71,7 +72,6 @@ from .service_enablement import ensure_services_enabled
 
 AP_FIELDS = ("ssid", "password", "channel", "subnet_octet")
 DEFAULT_SUBNET_OCTET = 50
-DEFAULT_UPSTREAM_SERVERS = ("1.1.1.1", "8.8.8.8")
 DEFAULT_DNS_TARGET: str | None = None
 VALIDATION_TIMEOUT_SECONDS = 15.0
 SERVICE_TIMEOUT_SECONDS = 15.0
@@ -91,6 +91,11 @@ UPSTREAM_WPA_GENERATED_CONF = Path(
     os.environ.get(
         "MCBRIDGE_GENERATED_UPSTREAM_WPA_CONF", str(GENERATED_DIR / f"wpa_supplicant-{UPSTREAM_INTERFACE}.conf")
     )
+)
+UPSTREAM_OVERRIDE_FIELDS = ("upstream_dns", "dns_servers", "upstream_servers")
+UPSTREAM_DHCP_RESOLV_PATHS = (
+    Path("/run/systemd/resolve/resolv.conf"),
+    Path("/etc/resolv.conf"),
 )
 
 
@@ -122,6 +127,13 @@ def _apply_overrides(base: Mapping[str, object], overrides: Mapping[str, object]
     merged = dict(base or {})
     merged.update({key: value for key, value in overrides.items() if value is not None})
     return merged
+
+
+def _sanitize_ap_config(config: Mapping[str, object]) -> dict[str, object]:
+    cleaned = dict(config or {})
+    for field in UPSTREAM_OVERRIDE_FIELDS:
+        cleaned.pop(field, None)
+    return cleaned
 
 
 def _normalize_timeout_stream(stream: object) -> str:
@@ -199,6 +211,30 @@ def _run_command(command: Sequence[str]) -> dict[str, object]:
         "stderr": process.stderr,
         "returncode": process.returncode,
     }
+
+
+def _is_loopback_address(server: str) -> bool:
+    try:
+        ip_value = ipaddress.ip_address(server)
+    except ValueError:
+        return False
+    return bool(ip_value.is_loopback or ip_value.is_unspecified)
+
+
+def _parse_resolv_nameservers(contents: str) -> list[str]:
+    servers: list[str] = []
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2 or parts[0] != "nameserver":
+            continue
+        server = parts[1].strip()
+        if not server or _is_loopback_address(server):
+            continue
+        servers.append(server)
+    return list(dict.fromkeys(servers))
 
 
 def _desired_ap_ip(subnet_octet: int) -> str:
@@ -520,8 +556,9 @@ def _detect_wlan0ap_ip() -> tuple[str | None, list[dict[str, object]]]:
 
 
 def _persist_ap_json(updated_config: Mapping[str, object], *, dry_run: bool) -> dict[str, object]:
+    sanitized_config = _sanitize_ap_config(updated_config)
     current_json_text = read_text(AP_JSON)
-    new_json_text = json.dumps(updated_config, indent=2) + "\n"
+    new_json_text = json.dumps(sanitized_config, indent=2) + "\n"
     result = {
         "path": str(AP_JSON),
         "diff": diff_text(current_json_text, new_json_text, fromfile=str(AP_JSON), tofile=f"{AP_JSON} (candidate)"),
@@ -536,7 +573,7 @@ def _persist_ap_json(updated_config: Mapping[str, object], *, dry_run: bool) -> 
 
     if current_json_text and current_json_text != new_json_text:
         write_history_file(CONFIG_HISTORY_DIR, suffix="ap.json", contents=current_json_text)
-    save_json(AP_JSON, dict(updated_config))
+    save_json(AP_JSON, dict(sanitized_config))
     result["applied"] = True
     result["status"] = "updated" if result["changed"] else "unchanged"
     return result
@@ -838,15 +875,15 @@ def _hostapd_template(config: Mapping[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _resolve_upstream_servers(config: Mapping[str, object]) -> list[str]:
-    upstream_config = config.get("upstream_dns") or config.get("dns_servers") or config.get("upstream_servers")
-    if isinstance(upstream_config, (list, tuple)):
-        upstream_servers = [str(entry).strip() for entry in upstream_config if str(entry or "").strip()]
-    elif isinstance(upstream_config, str) and upstream_config.strip():
-        upstream_servers = [upstream_config.strip()]
-    else:
-        upstream_servers = []
-    return list(dict.fromkeys(upstream_servers)) or list(DEFAULT_UPSTREAM_SERVERS)
+def _resolve_upstream_servers() -> list[str]:
+    for resolv_path in UPSTREAM_DHCP_RESOLV_PATHS:
+        contents = read_text(resolv_path)
+        if not contents:
+            continue
+        servers = _parse_resolv_nameservers(contents)
+        if servers:
+            return servers
+    return []
 
 
 def _apply_upstream_wifi_config(*, dry_run: bool) -> dict[str, object]:
@@ -945,7 +982,13 @@ def _ap_section_body(config: Mapping[str, object], *, upstream_servers: Sequence
     subnet_octet = int(config.get("subnet_octet") or DEFAULT_SUBNET_OCTET)
     base = f"192.168.{subnet_octet}."
 
-    upstream_servers = list(upstream_servers) if upstream_servers is not None else _resolve_upstream_servers(config)
+    upstream_servers = list(upstream_servers) if upstream_servers is not None else _resolve_upstream_servers()
+    if not upstream_servers:
+        resolv_paths = ", ".join(str(path) for path in UPSTREAM_DHCP_RESOLV_PATHS)
+        raise ValueError(
+            "No upstream DNS servers detected from DHCP-derived resolv.conf data. "
+            f"Checked {resolv_paths}; connect the upstream interface and retry."
+        )
 
     lines = [
         "",
@@ -1124,7 +1167,7 @@ def _dnsmasq_template(
     override_body: str | None = None,
 ) -> str:
     override_body = override_body or _default_dnsmasq_section_body()
-    upstream_servers = _resolve_upstream_servers(config)
+    upstream_servers = _resolve_upstream_servers()
     merged_active = active_config or existing_config
     if _managed_sections_conflict(merged_active, generated_config):
         logger.warning(
@@ -2242,6 +2285,7 @@ def update(
     config_to_apply: Mapping[str, object] = (
         stored_with_overrides if source_label == "stored JSON" else system_with_overrides
     )
+    config_to_apply = _sanitize_ap_config(config_to_apply)
     planned_mismatches = compare_configs(system_config, config_to_apply, fields=AP_FIELDS)
 
     if mismatches and not force:
