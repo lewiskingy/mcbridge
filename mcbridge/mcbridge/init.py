@@ -1120,6 +1120,14 @@ def _render_provisioning_artifacts(
             ),
             ".service",
         )
+        _write_temp(
+            "unit_upstream_dns_refresh",
+            systemd_units.upstream_dns_refresh_service_template(
+                upstream_interface=UPSTREAM_INTERFACE,
+                debounce_seconds=upstream_dns.DEBOUNCE_SECONDS,
+            ),
+            ".service",
+        )
         yield temp_paths
     finally:
         stack.close()
@@ -1228,6 +1236,8 @@ def _run_provisioning_script(
             command.extend(["--unit-wlan0ap", artifacts["unit_wlan0ap"]])
         if artifacts.get("unit_wlan0ap_ip"):
             command.extend(["--unit-wlan0ap-ip", artifacts["unit_wlan0ap_ip"]])
+        if artifacts.get("unit_upstream_dns_refresh"):
+            command.extend(["--unit-upstream-dns-refresh", artifacts["unit_upstream_dns_refresh"]])
 
         try:
             process = privileges.sudo_run(command, env=env, check=True)
