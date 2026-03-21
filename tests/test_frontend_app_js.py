@@ -133,7 +133,7 @@ console.log(
     assert output["selectedSsid"] == "Home"
 
 
-def test_upstream_psk_toggle_validates_length(tmp_path):
+def test_upstream_passphrase_payload_allows_hashed_passphrase_input(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     app_js = repo_root / "mcbridge" / "mcbridge" / "web" / "static" / "js" / "app.js"
     output = json.loads(
@@ -179,7 +179,7 @@ console.log(JSON.stringify({{ errorMessage }}));
         ),
     )
 
-    assert output["errorMessage"] == "PSK must be 64 hex characters."
+    assert output["errorMessage"] == ""
 
 
 def test_upstream_table_omits_password_column(tmp_path):
@@ -281,5 +281,5 @@ console.log(
         ),
     )
 
-    assert output["childCount"] == 5
-    assert output["emptyColSpan"] == 5
+    assert output["childCount"] == 7
+    assert output["emptyColSpan"] == 7
