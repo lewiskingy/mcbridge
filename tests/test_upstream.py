@@ -26,6 +26,7 @@ def test_upstream_add_and_list_persists(tmp_path: Path):
     assert data["profiles"][0]["password"] == derived
     assert len(derived) == 64
     assert profiles[0]["has_password"] is True
+    assert data["mode"]["prefer_recovery"] is True
 
 
 def test_upstream_validation(tmp_path: Path):
@@ -159,3 +160,46 @@ def test_save_current_config_uses_saved_passwords(monkeypatch: pytest.MonkeyPatc
 
     assert persisted[0]["ssid"] == "SavedOnly"
     assert persisted[0]["has_password"] is True
+
+
+def test_normalize_mode_defaults_to_prefer_recovery():
+    assert upstream._normalize_mode().prefer_recovery is True
+    assert upstream._normalize_mode({}).prefer_recovery is True
+    assert upstream._normalize_mode({"operation": "normal"}).prefer_recovery is False
+
+
+def test_set_mode_persists_explicit_prefer_primary(tmp_path: Path):
+    storage = tmp_path / "etc" / "config" / "upstream_networks.json"
+    upstream.add_profile(ssid="HomeNet", password="hunter2", priority=10, security="wpa2", path=storage)
+
+    payload = upstream.set_mode(operation="prefer_primary", path=storage)
+
+    assert payload["prefer_recovery"] is False
+    assert payload["operation"] == "prefer_primary"
+    stored = json.loads(storage.read_text())
+    assert stored["mode"]["prefer_recovery"] is False
+
+
+def test_select_profile_prefers_recovery_by_default():
+    recovery = upstream.UpstreamProfile("Recovery", "secret", 1, "wpa2", role="recovery")
+    primary = upstream.UpstreamProfile("Primary", "secret", 100, "wpa2", role="primary")
+
+    selected = upstream._select_profile([primary, recovery], available_ssids={"recovery", "primary"})
+    normal_selected = upstream._select_profile(
+        [primary, recovery],
+        mode=upstream.UpstreamMode(prefer_recovery=False),
+        available_ssids={"recovery", "primary"},
+    )
+
+    assert selected is recovery
+    assert normal_selected is primary
+
+
+def test_autoconnect_priority_respects_mode():
+    recovery = upstream.UpstreamProfile("Recovery", "secret", 5, "wpa2", role="recovery")
+    primary = upstream.UpstreamProfile("Primary", "secret", 99, "wpa2", role="primary")
+
+    assert upstream._autoconnect_priority(recovery) > upstream._autoconnect_priority(primary)
+    assert upstream._autoconnect_priority(
+        primary, mode=upstream.UpstreamMode(prefer_recovery=False)
+    ) > upstream._autoconnect_priority(recovery, mode=upstream.UpstreamMode(prefer_recovery=False))

@@ -802,6 +802,27 @@ def test_init_defers_unit_apply_until_after_confirmation(init_modules, monkeypat
     assert calls == [True, False]
 
 
+def test_seed_configs_writes_upstream_mode_default(init_modules):
+    _, common, _, _, init, _ = init_modules
+
+    plan = init._seed_configs(
+        ssid="SSID",
+        password="password1",
+        channel=6,
+        octet=51,
+        redirect=None,
+        target=None,
+        dry_run=False,
+    )
+
+    upstream_path = common.CONFIG_DIR / "upstream_networks.json"
+    stored = json.loads(upstream_path.read_text(encoding="utf-8"))
+
+    assert plan["upstream_networks_json"]["status"] == "seeded"
+    assert stored["mode"]["prefer_recovery"] is True
+    assert stored["mode"]["operation"] == "prefer_recovery"
+
+
 def test_run_provisioning_script_emits_output(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     import types
 

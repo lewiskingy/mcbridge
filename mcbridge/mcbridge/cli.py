@@ -11,6 +11,7 @@ import sys
 from typing import Any, Callable, Sequence
 
 from . import agent, ap, dns, init, upstream, upstream_dns
+from .common import response_payload
 
 LOG = logging.getLogger(__name__)
 
@@ -158,6 +159,21 @@ def _build_parser() -> argparse.ArgumentParser:
     upstream_forget = upstream_sub.add_parser("forget", help="Forget an upstream Wi-Fi connection")
     upstream_forget.add_argument("--ssid", required=True, help="SSID to forget")
     upstream_forget.add_argument("--interface", help="Network interface used for active connection checks")
+    upstream_mode = upstream_sub.add_parser("mode", help="Show or change upstream selection mode")
+    upstream_mode_sub = upstream_mode.add_subparsers(dest="mode_action", required=True)
+    upstream_mode_sub.add_parser("show", help="Show whether Recovery or normal operation is preferred")
+    upstream_mode_set = upstream_mode_sub.add_parser("set", help="Set Recovery preference or normal operation")
+    upstream_mode_group = upstream_mode_set.add_mutually_exclusive_group(required=True)
+    upstream_mode_group.add_argument(
+        "--prefer-recovery",
+        action="store_true",
+        help="Prefer Recovery whenever a Recovery profile is available",
+    )
+    upstream_mode_group.add_argument(
+        "--prefer-primary",
+        action="store_true",
+        help="Normal operation: prefer Primary/normal networks instead of Recovery",
+    )
     upstream_dns_refresh = upstream_sub.add_parser(
         "dns-refresh", help="Discover upstream DNS and optionally apply updates"
     )
@@ -229,6 +245,14 @@ def _handle_upstream_forget(args: argparse.Namespace) -> upstream.UpstreamResult
     return upstream.forget_system_profile(ssid=args.ssid, interface=args.interface)
 
 
+def _handle_upstream_mode(args: argparse.Namespace) -> upstream.UpstreamResult:
+    if args.mode_action == "show":
+        payload = upstream.get_mode()
+    else:
+        payload = upstream.set_mode(prefer_recovery=bool(args.prefer_recovery and not args.prefer_primary))
+    return upstream.UpstreamResult(response_payload(payload, verbose=True), 0)
+
+
 def _handle_upstream_dns_refresh(args: argparse.Namespace) -> upstream_dns.UpstreamDnsResult:
     return upstream_dns.refresh_upstream_dns(
         interface=args.interface,
@@ -298,6 +322,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         exit_code = _run(_handle_upstream_activate, args)
     elif args.domain == "upstream" and args.action == "forget":
         exit_code = _run(_handle_upstream_forget, args)
+    elif args.domain == "upstream" and args.action == "mode":
+        exit_code = _run(_handle_upstream_mode, args)
     elif args.domain == "upstream" and args.action == "dns-refresh":
         exit_code = _run(_handle_upstream_dns_refresh, args)
     else:  # pragma: no cover - argparse enforces choices

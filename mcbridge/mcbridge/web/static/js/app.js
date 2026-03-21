@@ -18,6 +18,7 @@ const upstreamState = {
   statusText: "",
   statusValue: "",
   busyMessage: "",
+  mode: null,
 };
 
 const formState = {
@@ -80,6 +81,8 @@ function cacheDashboardElements() {
     deleteUpstreamBtn: document.getElementById("deleteUpstreamBtn"),
     upstreamStatus: document.getElementById("upstreamStatus"),
     saveCurrentUpstreamBtn: document.getElementById("saveCurrentUpstreamBtn"),
+    upstreamModeSelect: document.getElementById("upstreamModeSelect"),
+    saveUpstreamModeBtn: document.getElementById("saveUpstreamModeBtn"),
   });
 }
 
@@ -524,11 +527,20 @@ function updateSaveCurrentButton() {
 }
 
 function renderUpstreamStatus(payload) {
-  const { upstreamStatus } = dashboardElements;
+  const { upstreamStatus, upstreamModeSelect, saveUpstreamModeBtn } = dashboardElements;
   const statusValue = payload?.status || "unknown";
-  setStateText(upstreamStatus, statusValue, statusValue);
-  upstreamState.statusText = statusValue;
+  const mode = payload?.mode || upstreamState.mode || null;
+  const modeLabel = mode?.operation_label ? ` — ${mode.operation_label}` : "";
+  setStateText(upstreamStatus, `${statusValue}${modeLabel}`, statusValue);
+  upstreamState.statusText = `${statusValue}${modeLabel}`;
   upstreamState.statusValue = statusValue;
+  upstreamState.mode = mode;
+  if (upstreamModeSelect && mode?.operation) {
+    upstreamModeSelect.value = mode.operation;
+  }
+  if (saveUpstreamModeBtn) {
+    saveUpstreamModeBtn.disabled = upstreamState.loading;
+  }
   upstreamState.profiles = Array.isArray(payload?.profiles) ? payload.profiles : [];
   upstreamState.storedProfiles = Array.isArray(payload?.stored_profiles) ? payload.stored_profiles : [];
   upstreamState.systemProfiles = Array.isArray(payload?.system_profiles) ? payload.system_profiles : [];
@@ -759,11 +771,13 @@ function setUpstreamBusy(isBusy, message) {
     upstreamPasswordToggle,
     upstreamPriorityInput,
     upstreamSecuritySelect,
+    upstreamModeSelect,
     refreshUpstreamBtn,
     saveUpstreamBtn,
     resetUpstreamBtn,
     deleteUpstreamBtn,
     saveCurrentUpstreamBtn,
+    saveUpstreamModeBtn,
   } = dashboardElements;
 
   if (isBusy) {
@@ -794,11 +808,13 @@ function setUpstreamBusy(isBusy, message) {
     upstreamPasswordToggle,
     upstreamPriorityInput,
     upstreamSecuritySelect,
+    upstreamModeSelect,
     refreshUpstreamBtn,
     saveUpstreamBtn,
     resetUpstreamBtn,
     deleteUpstreamBtn,
     saveCurrentUpstreamBtn,
+    saveUpstreamModeBtn,
   ].forEach((el) => {
     if (el) el.disabled = busy;
   });
@@ -841,6 +857,36 @@ async function fetchUpstreamStatus() {
     upstreamState.drift = null;
     renderUpstreamProfiles([]);
     updateSaveCurrentButton();
+  } finally {
+    setUpstreamBusy(false);
+  }
+}
+
+async function saveUpstreamMode() {
+  if (upstreamState.loading) return false;
+  const { upstreamModeSelect } = dashboardElements;
+  const operation = normalizeTextValue(upstreamModeSelect?.value) || "prefer_recovery";
+  setUpstreamBusy(true, "Saving upstream mode…");
+  setUpstreamError("");
+  try {
+    const res = await fetch("/upstream/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    showOutput(payload);
+    if (!res.ok || payload?.status === "error") {
+      const message = buildUpstreamErrorMessage(payload, `Unable to save upstream mode (${res.status})`);
+      setUpstreamError(message || `Unable to save upstream mode (${res.status})`);
+      return false;
+    }
+    upstreamState.mode = payload;
+    await fetchUpstreamStatus();
+    return true;
+  } catch (err) {
+    setUpstreamError(`Unable to save upstream mode: ${err}`);
+    return false;
   } finally {
     setUpstreamBusy(false);
   }
@@ -1325,6 +1371,8 @@ function bindEvents() {
     resetUpstreamBtn,
     deleteUpstreamBtn,
     saveCurrentUpstreamBtn,
+    upstreamModeSelect,
+    saveUpstreamModeBtn,
     upstreamPasswordToggle,
     upstreamPasswordInput,
   } = dashboardElements;
@@ -1342,6 +1390,14 @@ function bindEvents() {
   resetUpstreamBtn?.addEventListener("click", resetUpstreamForm);
   deleteUpstreamBtn?.addEventListener("click", handleUpstreamDelete);
   saveCurrentUpstreamBtn?.addEventListener("click", persistCurrentUpstreamConfig);
+  saveUpstreamModeBtn?.addEventListener("click", saveUpstreamMode);
+  upstreamModeSelect?.addEventListener("change", () => {
+    const selectedValue = normalizeTextValue(upstreamModeSelect.value);
+    const savedValue = normalizeTextValue(upstreamState.mode?.operation);
+    if (saveUpstreamModeBtn) {
+      saveUpstreamModeBtn.disabled = upstreamState.loading || selectedValue === savedValue;
+    }
+  });
   [apSsidInput, apPasswordInput, apOctetInput, apChannelInput].forEach((input) =>
     input?.addEventListener("input", updateApChangeState),
   );

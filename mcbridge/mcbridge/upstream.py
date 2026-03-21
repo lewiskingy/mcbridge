@@ -24,6 +24,16 @@ UPSTREAM_WPA_SUPPLICANT_CONF = Path(
 )
 LOG = logging.getLogger(__name__)
 WIFI_TYPES = {"wifi", "802-11-wireless", "802.11-wireless", "wireless"}
+UPSTREAM_ROLES = {"recovery", "primary", "secondary"}
+MODE_OPERATIONS = {
+    "prefer_recovery": True,
+    "recovery": True,
+    "recovery_preferred": True,
+    "prefer_primary": False,
+    "normal": False,
+    "normal_operation": False,
+    "primary_preferred": False,
+}
 
 
 @dataclass
@@ -32,10 +42,22 @@ class UpstreamProfile:
     password: str
     priority: int
     security: str
+    role: str = "primary"
+    enabled: bool = True
+    autoconnect: bool = True
 
     @property
     def has_password(self) -> bool:
         return bool(self.password)
+
+
+@dataclass(frozen=True)
+class UpstreamMode:
+    prefer_recovery: bool = True
+
+    @property
+    def operation(self) -> str:
+        return "prefer_recovery" if self.prefer_recovery else "prefer_primary"
 
 
 def _profile_key(ssid: str) -> str:
@@ -76,6 +98,59 @@ def _validate_security(security: Any) -> str:
     return cleaned
 
 
+def _normalize_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _validate_role(role: Any) -> str:
+    if role is None:
+        return "primary"
+    if not isinstance(role, str):
+        raise ValueError("role must be a string.")
+    cleaned = role.strip().lower()
+    if cleaned not in UPSTREAM_ROLES:
+        raise ValueError(f"role must be one of: {', '.join(sorted(UPSTREAM_ROLES))}.")
+    return cleaned
+
+
+def _normalize_mode(raw_mode: Any = None) -> UpstreamMode:
+    if isinstance(raw_mode, UpstreamMode):
+        return raw_mode
+    if not isinstance(raw_mode, Mapping):
+        return UpstreamMode()
+
+    operation = raw_mode.get("operation")
+    if isinstance(operation, str):
+        normalized = MODE_OPERATIONS.get(operation.strip().lower())
+        if normalized is not None:
+            return UpstreamMode(prefer_recovery=normalized)
+
+    return UpstreamMode(prefer_recovery=_normalize_bool(raw_mode.get("prefer_recovery"), default=True))
+
+
+def _mode_payload(mode: UpstreamMode | Mapping[str, Any] | None = None) -> dict[str, object]:
+    normalized = _normalize_mode(mode)
+    prefer_recovery = normalized.prefer_recovery
+    operation = normalized.operation
+    return {
+        "prefer_recovery": prefer_recovery,
+        "operation": operation,
+        "operation_label": "Prefer Recovery" if prefer_recovery else "Normal operation (prefer Primary)",
+        "prefer_primary": not prefer_recovery,
+        "prefer_primary_label": "Normal operation (prefer Primary)",
+    }
+
+
 def _normalize_password(password: Any) -> str:
     if password is None:
         return ""
@@ -113,6 +188,18 @@ def _load_raw(path: Path) -> Mapping[str, Any]:
     return load_json(path, default={})
 
 
+def _load_mode(path: Path | None = None) -> UpstreamMode:
+    storage_path = path or UPSTREAM_NETWORKS_JSON
+    raw_config = _load_raw(storage_path)
+
+    if not raw_config and not storage_path.exists() and path is None:
+        legacy = _load_raw(LEGACY_UPSTREAM_JSON)
+        if isinstance(legacy, Mapping) and legacy:
+            raw_config = legacy
+
+    return _normalize_mode(raw_config.get("mode") if isinstance(raw_config, Mapping) else None)
+
+
 def _load_profiles(path: Path | None = None, warnings: list[str] | None = None) -> tuple[list[UpstreamProfile], Path]:
     storage_path = path or UPSTREAM_NETWORKS_JSON
     raw_config = _load_raw(storage_path)
@@ -131,7 +218,10 @@ def _load_profiles(path: Path | None = None, warnings: list[str] | None = None) 
                 ssid = _validate_ssid(entry.get("ssid"))
                 priority = _validate_priority(entry.get("priority"))
                 security = _validate_security(entry.get("security"))
+                role = _validate_role(entry.get("role"))
                 password = _prepare_psk(ssid, security, entry.get("password", ""), require=False)
+                enabled = _normalize_bool(entry.get("enabled"), default=True)
+                autoconnect = _normalize_bool(entry.get("autoconnect"), default=True)
                 if _requires_password(security) and not password:
                     if warnings is not None:
                         warnings.append(f"password missing for secured SSID {ssid}")
@@ -146,6 +236,9 @@ def _load_profiles(path: Path | None = None, warnings: list[str] | None = None) 
                     password=password,
                     priority=priority,
                     security=security,
+                    role=role,
+                    enabled=enabled,
+                    autoconnect=autoconnect,
                 )
             )
     return profiles, storage_path
@@ -159,6 +252,8 @@ def load_profiles(path: Path | None = None, *, warnings: list[str] | None = None
 
 
 def _save_profiles(profiles: Sequence[UpstreamProfile], path: Path) -> None:
+    raw_config = _load_raw(path)
+    existing_mode = raw_config.get("mode") if isinstance(raw_config, Mapping) else None
     payload: MutableMapping[str, Any] = {
         "profiles": [
             {
@@ -166,15 +261,68 @@ def _save_profiles(profiles: Sequence[UpstreamProfile], path: Path) -> None:
                 "password": profile.password,
                 "priority": profile.priority,
                 "security": profile.security,
+                "role": profile.role,
+                "enabled": profile.enabled,
+                "autoconnect": profile.autoconnect,
             }
             for profile in profiles
-        ]
+        ],
+        "mode": _mode_payload(existing_mode),
     }
     save_json(path, payload)
 
 
 def _sorted_profiles(profiles: Iterable[UpstreamProfile]) -> list[UpstreamProfile]:
     return sorted(profiles, key=lambda profile: (-profile.priority, profile.ssid.lower()))
+
+
+def _role_order(role: str, *, prefer_recovery: bool) -> int:
+    normalized = _validate_role(role)
+    if prefer_recovery:
+        order = {"recovery": 0, "primary": 1, "secondary": 2}
+    else:
+        order = {"primary": 0, "secondary": 1, "recovery": 2}
+    return order.get(normalized, 3)
+
+
+def _select_profile(
+    profiles: Sequence[UpstreamProfile | DiscoveredProfile],
+    *,
+    mode: UpstreamMode | Mapping[str, Any] | None = None,
+    available_ssids: set[str] | None = None,
+) -> UpstreamProfile | DiscoveredProfile | None:
+    normalized_mode = _normalize_mode(mode)
+    candidates = [
+        profile
+        for profile in profiles
+        if getattr(profile, "enabled", True) and getattr(profile, "autoconnect", True)
+    ]
+    if available_ssids is not None:
+        available_candidates = [
+            profile for profile in candidates if _profile_key(getattr(profile, "ssid", "")) in available_ssids
+        ]
+        if available_candidates:
+            candidates = available_candidates
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda profile: (
+            _role_order(getattr(profile, "role", "primary"), prefer_recovery=normalized_mode.prefer_recovery),
+            -int(getattr(profile, "priority", 0)),
+            getattr(profile, "ssid", "").lower(),
+        ),
+    )
+
+
+def _autoconnect_priority(
+    profile: UpstreamProfile | DiscoveredProfile,
+    *,
+    mode: UpstreamMode | Mapping[str, Any] | None = None,
+) -> int:
+    normalized_mode = _normalize_mode(mode)
+    role_bias = 3 - _role_order(profile.role, prefer_recovery=normalized_mode.prefer_recovery)
+    return (role_bias * 1000) + int(profile.priority)
 
 
 def _annotate_profiles(profiles: Sequence[UpstreamProfile]) -> list[dict[str, object]]:
@@ -186,6 +334,9 @@ def _annotate_profiles(profiles: Sequence[UpstreamProfile]) -> list[dict[str, ob
                 "priority": profile.priority,
                 "security": profile.security,
                 "has_password": profile.has_password,
+                "role": profile.role,
+                "enabled": profile.enabled,
+                "autoconnect": profile.autoconnect,
             }
         )
     return annotated
@@ -198,10 +349,14 @@ def _inject_saved_passwords(
     updated: list[DiscoveredProfile] = []
     for profile in system_profiles:
         match = stored_map.get(_profile_key(profile.ssid))
-        if match and _requires_password(profile.security) and match.password:
-            profile.psk = match.password
-            profile.password = profile.password or ""
-            profile.password_missing = False
+        if match:
+            profile.role = match.role
+            profile.enabled = match.enabled
+            profile.autoconnect = match.autoconnect
+            if _requires_password(profile.security) and match.password:
+                profile.psk = match.password
+                profile.password = profile.password or ""
+                profile.password_missing = False
         updated.append(profile)
     return updated
 
@@ -214,12 +369,21 @@ def list_profiles(path: Path | None = None) -> list[dict[str, object]]:
 
 
 def add_profile(
-    *, ssid: str, password: str, priority: int, security: str, path: Path | None = None
+    *,
+    ssid: str,
+    password: str,
+    priority: int,
+    security: str,
+    role: str | None = None,
+    enabled: bool = True,
+    autoconnect: bool = True,
+    path: Path | None = None,
 ) -> list[dict[str, object]]:
     cleaned_ssid = _validate_ssid(ssid)
     cleaned_security = _validate_security(security)
     cleaned_priority = _validate_priority(priority)
     cleaned_password = _prepare_psk(cleaned_ssid, cleaned_security, password, require=True)
+    cleaned_role = _validate_role(role)
 
     profiles, storage_path = _load_profiles(path)
     key = _profile_key(cleaned_ssid)
@@ -232,6 +396,9 @@ def add_profile(
             password=cleaned_password,
             priority=cleaned_priority,
             security=cleaned_security,
+            role=cleaned_role,
+            enabled=_normalize_bool(enabled, default=True),
+            autoconnect=_normalize_bool(autoconnect, default=True),
         )
     )
 
@@ -246,6 +413,9 @@ def update_profile(
     password: str | None = None,
     priority: int | None = None,
     security: str | None = None,
+    role: str | None = None,
+    enabled: bool | None = None,
+    autoconnect: bool | None = None,
     path: Path | None = None,
 ) -> list[dict[str, object]]:
     cleaned_ssid = _validate_ssid(ssid)
@@ -255,15 +425,21 @@ def update_profile(
     if existing is None:
         raise ValueError(f"SSID {cleaned_ssid} was not found.")
 
-    if priority is None and security is None and password is None:
+    if priority is None and security is None and password is None and role is None and enabled is None and autoconnect is None:
         raise ValueError("No fields to update.")
 
     if priority is not None:
         existing.priority = _validate_priority(priority)
     if security is not None:
         existing.security = _validate_security(security)
+    if role is not None:
+        existing.role = _validate_role(role)
     if password is not None:
         existing.password = _prepare_psk(existing.ssid, existing.security, password, require=True)
+    if enabled is not None:
+        existing.enabled = _normalize_bool(enabled, default=True)
+    if autoconnect is not None:
+        existing.autoconnect = _normalize_bool(autoconnect, default=True)
 
     if _requires_password(existing.security) and not existing.password:
         raise ValueError("password is required for secured networks.")
@@ -292,6 +468,9 @@ class DiscoveredProfile:
     ssid: str
     priority: int
     security: str
+    role: str = "primary"
+    enabled: bool = True
+    autoconnect: bool = True
     password: str = ""
     psk: str | None = None
     source: str | None = None
@@ -647,12 +826,14 @@ def apply_upstream(
 ) -> UpstreamResult:
     warnings: list[str] = []
     profiles = load_profiles(path, warnings=warnings)
+    mode = _load_mode(path)
     if not profiles:
         payload = {
             "status": "error",
             "exit_code": 2,
             "message": "No upstream Wi-Fi profiles saved.",
             "warnings": warnings,
+            "mode": _mode_payload(mode),
         }
         return UpstreamResult(response_payload(payload, verbose=True), 2)
 
@@ -773,9 +954,9 @@ def apply_upstream(
             "modify",
             connection_name,
             "connection.autoconnect",
-            "yes",
+            "yes" if profile.enabled and profile.autoconnect else "no",
             "connection.autoconnect-priority",
-            str(profile.priority),
+            str(_autoconnect_priority(profile, mode=mode)),
             "connection.interface-name",
             interface_name,
             "802-11-wireless.ssid",
@@ -801,18 +982,19 @@ def apply_upstream(
         if not created:
             changes.append({"ssid": profile.ssid, "action": "updated", "connection": connection_name})
 
-    preferred = sorted_profiles[0]
-    connect_result = _safe_nmcli(
-        ["connection", "up", preferred.ssid, "ifname", interface_name],
-        errors=errors,
-        context=f"Failed to activate {preferred.ssid}",
-    )
-    if connect_result is None:
-        pass
-    elif connect_result.returncode != 0:
-        errors.append(_nmcli_stderr(connect_result) or f"Failed to activate {preferred.ssid}")
-    else:
-        changes.append({"ssid": preferred.ssid, "action": "activated", "connection": preferred.ssid})
+    preferred = _select_profile(sorted_profiles, mode=mode)
+    if preferred is not None:
+        connect_result = _safe_nmcli(
+            ["connection", "up", preferred.ssid, "ifname", interface_name],
+            errors=errors,
+            context=f"Failed to activate {preferred.ssid}",
+        )
+        if connect_result is None:
+            pass
+        elif connect_result.returncode != 0:
+            errors.append(_nmcli_stderr(connect_result) or f"Failed to activate {preferred.ssid}")
+        else:
+            changes.append({"ssid": preferred.ssid, "action": "activated", "connection": preferred.ssid})
 
     active_ssid, active_errors = _active_upstream_connection(interface_name)
     errors.extend(active_errors)
@@ -832,6 +1014,7 @@ def apply_upstream(
         "interface": interface_name,
         "active_ssid": active_ssid,
         "prune_missing": prune_missing,
+        "mode": _mode_payload(mode),
         "changes": changes,
         "warnings": warnings,
         "errors": errors,
@@ -1024,12 +1207,24 @@ def _drift_summary(
         system_profile = system_map.get(key)
         if not system_profile:
             continue
-        if stored_profile.priority != system_profile.priority or stored_profile.security != system_profile.security:
+        if (
+            stored_profile.priority != system_profile.priority
+            or stored_profile.security != system_profile.security
+            or stored_profile.role != system_profile.role
+        ):
             mismatched.append(
                 {
                     "ssid": stored_profile.ssid,
-                    "stored": {"priority": stored_profile.priority, "security": stored_profile.security},
-                    "system": {"priority": system_profile.priority, "security": system_profile.security},
+                    "stored": {
+                        "priority": stored_profile.priority,
+                        "security": stored_profile.security,
+                        "role": stored_profile.role,
+                    },
+                    "system": {
+                        "priority": system_profile.priority,
+                        "security": system_profile.security,
+                        "role": system_profile.role,
+                    },
                 }
             )
 
@@ -1059,6 +1254,9 @@ def _annotate_discovered(profiles: Sequence[DiscoveredProfile]) -> list[dict[str
                 "has_password": profile.has_password,
                 "password_missing": profile.password_missing,
                 "source": profile.source or "system",
+                "role": profile.role,
+                "enabled": profile.enabled,
+                "autoconnect": profile.autoconnect,
             }
         )
     return annotated
@@ -1081,11 +1279,16 @@ def _combine_display_profiles(
             "has_password": profile.has_password,
             "password_missing": profile.password_missing,
             "source": profile.source or "system",
+            "role": profile.role,
+            "enabled": profile.enabled,
+            "autoconnect": profile.autoconnect,
             "saved": stored_match is not None,
             "drift": False,
         }
         if stored_match and (
-            stored_match.priority != profile.priority or stored_match.security != profile.security
+            stored_match.priority != profile.priority
+            or stored_match.security != profile.security
+            or stored_match.role != profile.role
         ):
             entry["drift"] = True
         display.append(entry)
@@ -1099,6 +1302,9 @@ def _combine_display_profiles(
                 "has_password": leftover.has_password,
                 "password_missing": False,
                 "source": "saved",
+                "role": leftover.role,
+                "enabled": leftover.enabled,
+                "autoconnect": leftover.autoconnect,
                 "saved": True,
                 "drift": True,
             }
@@ -1134,9 +1340,52 @@ def _merge_scan_results(
     return merged
 
 
+def get_mode(path: Path | None = None) -> dict[str, object]:
+    return _mode_payload(_load_mode(path))
+
+
+def set_mode(
+    *,
+    prefer_recovery: bool | None = None,
+    operation: str | None = None,
+    path: Path | None = None,
+) -> dict[str, object]:
+    if prefer_recovery is None and operation is None:
+        raise ValueError("prefer_recovery or operation is required.")
+
+    if operation is not None:
+        normalized = MODE_OPERATIONS.get(operation.strip().lower())
+        if normalized is None:
+            raise ValueError("operation must be one of: prefer_recovery, prefer_primary, normal.")
+        mode = UpstreamMode(prefer_recovery=normalized)
+    else:
+        mode = UpstreamMode(prefer_recovery=_normalize_bool(prefer_recovery, default=True))
+
+    storage_path = path or UPSTREAM_NETWORKS_JSON
+    profiles, _ = _load_profiles(path)
+    payload: MutableMapping[str, Any] = {
+        "profiles": [
+            {
+                "ssid": profile.ssid,
+                "password": profile.password,
+                "priority": profile.priority,
+                "security": profile.security,
+                "role": profile.role,
+                "enabled": profile.enabled,
+                "autoconnect": profile.autoconnect,
+            }
+            for profile in profiles
+        ],
+        "mode": _mode_payload(mode),
+    }
+    save_json(storage_path, payload)
+    return payload["mode"]
+
+
 def status(path: Path | None = None) -> dict[str, object]:
     stored_warnings: list[str] = []
     stored_profiles = load_profiles(path, warnings=stored_warnings)
+    mode = _load_mode(path)
     system_profiles, system_warnings, discovery_details = discover_system_profiles()
     system_profiles = _inject_saved_passwords(system_profiles, stored_profiles)
     drift = _drift_summary(stored_profiles, system_profiles)
@@ -1154,6 +1403,13 @@ def status(path: Path | None = None) -> dict[str, object]:
         "system_profiles": _annotate_discovered(system_profiles),
         "profiles": profiles,
         "drift": drift,
+        "mode": _mode_payload(mode),
+        "selected_profile": (
+            _annotate_discovered([selected])[0]
+            if (selected := _select_profile(system_profiles, mode=mode, available_ssids={_profile_key(p["ssid"]) for p in profiles if p.get("availability") in {"available", "active"}}))
+            is not None
+            else None
+        ),
         "warnings": warnings,
         "discovery": {**discovery_details, "scan": scan_details},
     }
@@ -1198,6 +1454,7 @@ def save_current_config(path: Path | None = None) -> list[dict[str, object]]:
 __all__ = [
     "LEGACY_UPSTREAM_JSON",
     "UPSTREAM_NETWORKS_JSON",
+    "UpstreamMode",
     "UpstreamProfile",
     "DiscoveredProfile",
     "UpstreamResult",
@@ -1206,9 +1463,11 @@ __all__ = [
     "apply_upstream",
     "discover_system_profiles",
     "forget_system_profile",
+    "get_mode",
     "list_profiles",
     "load_profiles",
     "save_current_config",
+    "set_mode",
     "status",
     "remove_profile",
     "update_profile",
