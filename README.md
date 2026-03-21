@@ -14,9 +14,9 @@ In flight work is documented in /plans. If you want to contribute, please open a
 
 Full details live in the web console docs (served under **Docs**) and in GitHub at `mcbridge/mcbridge/web/static/docs/`:
 
-- [Overview](https://raw.githubusercontent.com/lewiskingy/mcbridge/refs/heads/main/mcbridge/mcbridge/web/static/docs/Overview.md)
-- [Install](https://raw.githubusercontent.com/lewiskingy/mcbridge/refs/heads/main/mcbridge/mcbridge/web/static/docs/INSTALL.md)
-- [Provisioning](https://raw.githubusercontent.com/lewiskingy/mcbridge/refs/heads/main/mcbridge/mcbridge/web/static/docs/PROVISIONING.md)
-- [Usage](https://raw.githubusercontent.com/lewiskingy/mcbridge/refs/heads/main/mcbridge/mcbridge/web/static/docs/USAGE.md)
-- [Design](https://raw.githubusercontent.com/lewiskingy/mcbridge/refs/heads/main/mcbridge/mcbridge/web/static/docs/DESIGN.md)
-- [Developer roadmap](https://raw.githubusercontent.com/lewiskingy/mcbridge/refs/heads/main/mcbridge/mcbridge/web/static/docs/DEVELOPER_ROADMAP.md)
+- [Overview](https://github.com/lewiskingy/mcbridge/blob/main/mcbridge/mcbridge/web/static/docs/Overview.md)
+- [Install](https://github.com/lewiskingy/mcbridge/blob/main/mcbridge/mcbridge/web/static/docs/INSTALL.md)
+- [Provisioning](https://github.com/lewiskingy/mcbridge/blob/main/mcbridge/mcbridge/web/static/docs/PROVISIONING.md)
+- [Usage](https://github.com/lewiskingy/mcbridge/blob/main/mcbridge/mcbridge/web/static/docs/USAGE.md)
+- [Design](https://github.com/lewiskingy/mcbridge/blob/main/mcbridge/mcbridge/web/static/docs/DESIGN.md)
+- [Developer roadmap](https://github.com/lewiskingy/mcbridge/blob/main/mcbridge/mcbridge/web/static/docs/DEVELOPER_ROADMAP.md)
