@@ -529,7 +529,10 @@ def _invoke_cli(args: Sequence[str], timeout: float | None = None) -> tuple[Mapp
     cli_command = ["bash", "-lc", shlex.join(base_command)]
     try:
         client = _agent_client(timeout=timeout)
-        result = client.run_command(cli_command, env=_cli_env(), timeout=timeout)
+        try:
+            result = client.run_command(cli_command, env=_cli_env(), timeout=timeout)
+        except TypeError:
+            result = client.run_command(cli_command, env=_cli_env())
     except AgentError as exc:
         detail = getattr(exc, "detail", {})
         if isinstance(detail, Mapping) and detail.get("timeout") is True:
@@ -1065,8 +1068,16 @@ def _call_runner(
     fallback_runner: Callable[[Sequence[str], float | None], tuple[Mapping[str, Any], HTTPStatus]] | None = None,
     timeout: float | None = None,
 ) -> tuple[tuple[Mapping[str, Any], HTTPStatus] | None, tuple[Any, HTTPStatus] | None]:
+    def _invoke(
+        candidate: Callable[[Sequence[str], float | None], tuple[Mapping[str, Any], HTTPStatus]],
+    ) -> tuple[Mapping[str, Any], HTTPStatus]:
+        try:
+            return candidate(args, timeout)
+        except TypeError:
+            return candidate(args)
+
     try:
-        return runner(args, timeout), None
+        return _invoke(runner), None
     except BadRequest:
         raise
     except Exception as exc:  # pragma: no cover - routed through _runner_error_response
@@ -1076,7 +1087,7 @@ def _call_runner(
         )
         if fallback_allowed:
             try:
-                return fallback_runner(args, timeout), None
+                return _invoke(fallback_runner), None
             except BadRequest:
                 raise
             except Exception as fallback_exc:  # pragma: no cover - routed through _runner_error_response
@@ -1337,6 +1348,29 @@ def create_app(
             return _runner_error_response(exc)
         return jsonify(payload), HTTPStatus.OK
 
+    @app.get("/upstream/mode")
+    def upstream_mode():
+        try:
+            payload = upstream.get_mode()
+        except BadRequest:
+            raise
+        except Exception as exc:  # pragma: no cover - routed through _runner_error_response
+            return _runner_error_response(exc)
+        return jsonify(payload), HTTPStatus.OK
+
+    @app.post("/upstream/mode")
+    def upstream_mode_update():
+        body = _json_body()
+        operation = _coerce_str(body.get("operation"), "operation") if "operation" in body else None
+        prefer_recovery = _coerce_bool(body.get("prefer_recovery"), "prefer_recovery", default=None)
+        try:
+            payload = upstream.set_mode(operation=operation, prefer_recovery=prefer_recovery)
+        except BadRequest:
+            raise
+        except Exception as exc:  # pragma: no cover - routed through _runner_error_response
+            return _runner_error_response(exc)
+        return jsonify(payload), HTTPStatus.OK
+
     @app.post("/upstream/profiles")
     def upstream_profiles_add():
         body = _json_body()
@@ -1438,7 +1472,7 @@ def create_app(
         _add_option(args, "--password", _coerce_str(body.get("password"), "password"))
         _add_option(args, "--octet", subnet_octet)
         _add_option(args, "--channel", channel)
-        _add_option(args, "--target", _coerce_str(body.get("target"), "target", required=True))
+        _add_option(args, "--target", _coerce_str(body.get("target"), "target"))
         _add_option(args, "--redirect", _coerce_str(body.get("redirect"), "redirect"))
         _add_flag(args, "--force", _coerce_bool(body.get("force"), "force", default=False))
         force_restart = _coerce_bool(body.get("force_restart"), "force_restart", default=True)

@@ -117,6 +117,14 @@
       <div class="actions">
         <span class="label">Status</span>
         <div class="value state" id="upstreamStatus">Loading…</div>
+        <label class="form-field compact">
+          <span class="label">Operation</span>
+          <select id="upstreamModeSelect" name="upstream_mode">
+            <option value="prefer_recovery">Prefer Recovery</option>
+            <option value="prefer_primary">Normal operation (prefer Primary)</option>
+          </select>
+        </label>
+        <button type="button" class="secondary" id="saveUpstreamModeBtn">Save mode</button>
         <button type="button" id="refreshUpstreamBtn">Refresh</button>
         <button type="button" class="secondary" id="saveCurrentUpstreamBtn" disabled>Save current config</button>
       </div>

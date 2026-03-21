@@ -1020,6 +1020,12 @@ def _seed_configs(
 
     plan = {
         "ap_json": {"path": str(AP_JSON), "payload": ap_payload},
+        "upstream_networks_json": {
+            "path": str(CONFIG_DIR / "upstream_networks.json"),
+            "payload": {"profiles": [], "mode": {"prefer_recovery": True, "operation": "prefer_recovery"}},
+            "status": "planned" if (CONFIG_DIR / "upstream_networks.json").exists() else "seed_missing",
+            "applied": False,
+        },
         "knownservers_json": known_servers_plan,
         "dns_overrides_json": dns_plan,
     }
@@ -1030,6 +1036,27 @@ def _seed_configs(
 
     ensure_parent(CONFIG_DIR)
     save_json(AP_JSON, ap_payload)
+    upstream_networks_path = CONFIG_DIR / "upstream_networks.json"
+    if not upstream_networks_path.exists():
+        save_json(
+            upstream_networks_path,
+            {"profiles": [], "mode": {"prefer_recovery": True, "operation": "prefer_recovery"}},
+        )
+        plan["upstream_networks_json"]["status"] = "seeded"
+        plan["upstream_networks_json"]["applied"] = True
+    else:
+        existing_upstream = load_json(upstream_networks_path, default={"profiles": []})
+        if not isinstance(existing_upstream, Mapping):
+            existing_upstream = {"profiles": []}
+        existing_upstream = dict(existing_upstream)
+        mode_payload = existing_upstream.get("mode")
+        if not isinstance(mode_payload, Mapping):
+            existing_upstream["mode"] = {"prefer_recovery": True, "operation": "prefer_recovery"}
+            save_json(upstream_networks_path, existing_upstream)
+            plan["upstream_networks_json"]["status"] = "updated"
+            plan["upstream_networks_json"]["applied"] = True
+        else:
+            plan["upstream_networks_json"]["status"] = "unchanged"
     if dns_payload:
         ensure_parent(DNS_OVERRIDES_JSON)
         save_json(DNS_OVERRIDES_JSON, dns_payload)
@@ -2282,8 +2309,16 @@ def run(
         else:
             payload_sections.append({"dns_update": {"skipped": True, "reason": "no_redirect_target"}})
 
-        upstream_dns_result = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
-        payload_sections.append({"upstream_dns_refresh": upstream_dns_result.payload})
+        upstream_networks_path = CONFIG_DIR / "upstream_networks.json"
+        upstream_config = load_json(upstream_networks_path, default={}) if upstream_networks_path.exists() else {}
+        has_upstream_profiles = bool(
+            isinstance(upstream_config, Mapping) and (upstream_config.get("profiles") or [])
+        )
+        if has_upstream_profiles:
+            upstream_dns_result = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
+            payload_sections.append({"upstream_dns_refresh": upstream_dns_result.payload})
+        else:
+            payload_sections.append({"upstream_dns_refresh": {"skipped": True, "reason": "no_upstream_profiles"}})
 
         ap_result = ap.update(
             ssid=ssid,

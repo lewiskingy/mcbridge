@@ -515,6 +515,27 @@ def test_upstream_save_current(monkeypatch: pytest.MonkeyPatch, tmp_path):
     assert stored["profiles"][0]["ssid"] == "SystemNet"
 
 
+def test_upstream_mode_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    import mcbridge.web as web
+
+    config_dir = tmp_path / "etc" / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    upstream_path = config_dir / "upstream_networks.json"
+    monkeypatch.setattr(web.upstream, "UPSTREAM_NETWORKS_JSON", upstream_path)
+    monkeypatch.setattr(web.upstream, "LEGACY_UPSTREAM_JSON", upstream_path)
+
+    client = create_app(cli_runner=lambda args: ({}, HTTPStatus.OK)).test_client()
+
+    initial = client.get("/upstream/mode")
+    assert initial.status_code == HTTPStatus.OK
+    assert initial.get_json()["prefer_recovery"] is True
+
+    updated = client.post("/upstream/mode", json={"operation": "prefer_primary"})
+    assert updated.status_code == HTTPStatus.OK
+    assert updated.get_json()["prefer_recovery"] is False
+    assert updated.get_json()["operation"] == "prefer_primary"
+
+
 def test_agent_unavailable_error_includes_hint(monkeypatch: pytest.MonkeyPatch):
     import mcbridge.web as web
 
