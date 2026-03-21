@@ -24,7 +24,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Mapping, Sequence
 
-from . import agent, ap, dns, upstream_dns
+from . import agent, ap, dns, upstream, upstream_dns
 from .common import (
     AP_JSON,
     CONFIG_DIR,
@@ -973,6 +973,12 @@ def _seed_configs(
     redirect: str | None,
     target: str | None,
     dry_run: bool,
+    recovery_ssid: str | None = None,
+    recovery_password: str | None = None,
+    primary_ssid: str | None = None,
+    primary_password: str | None = None,
+    secondary_ssid: str | None = None,
+    secondary_password: str | None = None,
 ) -> dict[str, Any]:
     ap_payload = {"ssid": ssid, "password": password, "channel": channel, "subnet_octet": octet}
     packaged_known_servers = _load_default_known_servers()
@@ -1018,10 +1024,44 @@ def _seed_configs(
     if not dns_payload:
         dns_plan["status"] = "skipped"
 
+    upstream_profiles_plan = []
+    upstream_payload = None
+    seed_candidates = [
+        (recovery_ssid, recovery_password, "recovery", 100),
+        (primary_ssid, primary_password, "primary", 80),
+        (secondary_ssid, secondary_password, "secondary", 60),
+    ]
+    for candidate_ssid, candidate_password, role, priority in seed_candidates:
+        if not (candidate_ssid or "").strip():
+            continue
+        upstream_profiles_plan.append(
+            {
+                "ssid": candidate_ssid.strip(),
+                "password": candidate_password or "",
+                "priority": priority,
+                "security": "wpa2" if (candidate_password or "") else "open",
+                "role": role,
+                "enabled": True,
+                "autoconnect": True,
+            }
+        )
+    if upstream_profiles_plan:
+        upstream_payload = {
+            "profiles": [
+                {
+                    **entry,
+                    "password": upstream._prepare_psk(entry["ssid"], entry["security"], entry["password"], require=entry["security"] != "open"),
+                }
+                for entry in upstream_profiles_plan
+            ],
+            "mode": {"prefer_recovery": False, "diagnostics_enabled": False},
+        }
+
     plan = {
         "ap_json": {"path": str(AP_JSON), "payload": ap_payload},
         "knownservers_json": known_servers_plan,
         "dns_overrides_json": dns_plan,
+        "upstream_networks_json": {"path": str(upstream.UPSTREAM_NETWORKS_JSON), "payload": upstream_payload or {}, "status": "seed_missing" if upstream_payload else "skipped"},
     }
 
     if dry_run:
@@ -1038,6 +1078,10 @@ def _seed_configs(
     save_json(KNOWN_SERVERS_JSON, known_servers)
     known_servers_plan["status"] = "updated" if known_servers_exists else "seeded"
     known_servers_plan["applied"] = True
+    if upstream_payload:
+        save_json(upstream.UPSTREAM_NETWORKS_JSON, upstream_payload)
+        plan["upstream_networks_json"]["status"] = "seeded"
+        plan["upstream_networks_json"]["applied"] = True
     plan["applied"] = True
     return plan
 
@@ -1840,6 +1884,12 @@ def run(
     channel: int | None = None,
     target: str | None = None,
     redirect: str | None = None,
+    recovery_ssid: str | None = None,
+    recovery_password: str | None = None,
+    primary_ssid: str | None = None,
+    primary_password: str | None = None,
+    secondary_ssid: str | None = None,
+    secondary_password: str | None = None,
     force: bool = False,
     force_restart: bool = True,
     prepare_only: bool = False,
@@ -1997,6 +2047,12 @@ def run(
         redirect=redirect,
         target=target,
         dry_run=dry_run,
+        recovery_ssid=recovery_ssid,
+        recovery_password=recovery_password,
+        primary_ssid=primary_ssid,
+        primary_password=primary_password,
+        secondary_ssid=secondary_ssid,
+        secondary_password=secondary_password,
     )
 
     payload_sections: list[Mapping[str, Any]] = [{"status": "ok", "message": "mcbridge init plan ready.", "plan": summary}]
@@ -2208,6 +2264,10 @@ def run(
                 )
                 return InitResult(payload=payload, exit_code=web_exit_code if web_exit_code else 3)
 
+    if not prepare_only:
+        upstream_dns_preview = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
+        payload_sections.append({"upstream_dns_refresh": upstream_dns_preview.payload})
+
     provision_result = _run_provisioning_script(
         ssid=ssid,
         password=resolved_password,
@@ -2282,8 +2342,9 @@ def run(
         else:
             payload_sections.append({"dns_update": {"skipped": True, "reason": "no_redirect_target"}})
 
-        upstream_dns_result = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
-        payload_sections.append({"upstream_dns_refresh": upstream_dns_result.payload})
+        if any([(recovery_ssid or "").strip(), (primary_ssid or "").strip(), (secondary_ssid or "").strip()]):
+            upstream_apply_result = upstream.apply_upstream(prune_missing=False)
+            payload_sections.append({"upstream_apply": upstream_apply_result.payload})
 
         ap_result = ap.update(
             ssid=ssid,

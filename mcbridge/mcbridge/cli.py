@@ -77,6 +77,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Validate, seed configs, provision units/packages, and enable services without rendering hostapd/dnsmasq."
         " Follow with 'mcbridge ap update' to generate configs and start services.",
     )
+    init_parser.add_argument("--recovery-ssid", help="Recovery hotspot SSID for upstream commissioning")
+    init_parser.add_argument("--recovery-password", help="Recovery hotspot password")
+    init_parser.add_argument("--primary-ssid", help="Primary upstream SSID")
+    init_parser.add_argument("--primary-password", help="Primary upstream password")
+    init_parser.add_argument("--secondary-ssid", help="Optional secondary upstream SSID")
+    init_parser.add_argument("--secondary-password", help="Optional secondary upstream password")
     init_parser.add_argument("--debug-json", action="store_true", help="Emit full JSON payload")
     init_parser.add_argument("--yes", action="store_true", help="Skip confirmation prompts")
     init_parser.add_argument("--service-user", default=init.SERVICE_USER, help="Service user for mcbridge-managed units")
@@ -146,12 +152,38 @@ def _build_parser() -> argparse.ArgumentParser:
 
     upstream_parser = subparsers.add_parser("upstream", help="Upstream Wi-Fi controls")
     upstream_sub = upstream_parser.add_subparsers(dest="action", required=True)
+    upstream_status = upstream_sub.add_parser("status", help="Show upstream Wi-Fi status")
+    upstream_status.add_argument("--debug-json", action="store_true", help="Emit full JSON payload")
+    upstream_update = upstream_sub.add_parser("update", help="Create or update an upstream Wi-Fi profile")
+    upstream_update.add_argument("--ssid", required=True, help="SSID to create or update")
+    upstream_update.add_argument("--password", help="Passphrase or pre-hashed PSK")
+    upstream_update.add_argument("--priority", type=_positive_int, help="Connection priority")
+    upstream_update.add_argument("--security", help="Security mode (wpa2, wpa3, open)")
+    upstream_update.add_argument("--role", choices=sorted(upstream.UPSTREAM_ROLES), help="Role for the upstream profile")
+    upstream_update.add_argument("--enabled", dest="enabled", action="store_true", help="Enable the profile")
+    upstream_update.add_argument("--disabled", dest="enabled", action="store_false", help="Disable the profile")
+    upstream_update.add_argument("--autoconnect", dest="autoconnect", action="store_true", help="Allow autoconnect")
+    upstream_update.add_argument("--no-autoconnect", dest="autoconnect", action="store_false", help="Disable autoconnect")
+    upstream_update.set_defaults(enabled=None, autoconnect=None)
     upstream_apply = upstream_sub.add_parser("apply", help="Apply upstream Wi-Fi profiles")
     upstream_apply.add_argument(
         "--prune-missing",
         action="store_true",
         help="Delete NetworkManager Wi-Fi profiles not present in saved upstream profiles",
     )
+    upstream_reconnect = upstream_sub.add_parser("reconnect", help="Force an upstream reconnect using selection policy")
+    upstream_reconnect.add_argument(
+        "--prune-missing",
+        action="store_true",
+        help="Delete NetworkManager Wi-Fi profiles not present in saved upstream profiles",
+    )
+    upstream_diag = upstream_sub.add_parser("diagnostics", help="Manage upstream diagnostics")
+    upstream_diag_sub = upstream_diag.add_subparsers(dest="diagnostics_action", required=True)
+    upstream_diag_enable = upstream_diag_sub.add_parser("enable", help="Enable upstream diagnostics")
+    upstream_diag_disable = upstream_diag_sub.add_parser("disable", help="Disable upstream diagnostics")
+    upstream_diag_show = upstream_diag_sub.add_parser("show", help="Show upstream diagnostics")
+    upstream_prefer = upstream_sub.add_parser("prefer-recovery", help="Toggle prefer recovery mode")
+    upstream_prefer.add_argument("state", choices=["enable", "disable"])
     upstream_activate = upstream_sub.add_parser("activate", help="Activate an upstream Wi-Fi connection")
     upstream_activate.add_argument("--ssid", required=True, help="SSID to activate")
     upstream_activate.add_argument("--interface", help="Network interface to activate on")
@@ -217,8 +249,62 @@ def _handle_dns_menu(args: argparse.Namespace) -> dns.DnsResult:
     return dns.menu(dry_run=args.dry_run, force=args.force, debug_json=args.debug_json)
 
 
+def _handle_upstream_status(args: argparse.Namespace) -> upstream.UpstreamResult:
+    payload = upstream.status()
+    return upstream.UpstreamResult(payload=payload, exit_code=int(payload.get("exit_code", 0) or 0))
+
+
+def _handle_upstream_update(args: argparse.Namespace) -> upstream.UpstreamResult:
+    existing = {entry["ssid"].lower(): entry for entry in upstream.list_profiles()}
+    key = args.ssid.strip().lower()
+    if key in existing:
+        profiles = upstream.update_profile(
+            ssid=args.ssid,
+            password=args.password,
+            priority=args.priority,
+            security=args.security,
+            role=args.role,
+            enabled=args.enabled,
+            autoconnect=args.autoconnect,
+        )
+    else:
+        if args.priority is None:
+            raise ValueError("priority is required when creating a new upstream profile")
+        if args.security is None:
+            raise ValueError("security is required when creating a new upstream profile")
+        profiles = upstream.add_profile(
+            ssid=args.ssid,
+            password=args.password or "",
+            priority=args.priority,
+            security=args.security,
+            role=args.role or upstream.DEFAULT_ROLE,
+            enabled=True if args.enabled is None else args.enabled,
+            autoconnect=True if args.autoconnect is None else args.autoconnect,
+        )
+    payload = {"status": "ok", "exit_code": 0, "profiles": profiles}
+    return upstream.UpstreamResult(payload=payload, exit_code=0)
+
+
 def _handle_upstream_apply(args: argparse.Namespace) -> upstream.UpstreamResult:
     return upstream.apply_upstream(prune_missing=args.prune_missing)
+
+
+def _handle_upstream_reconnect(args: argparse.Namespace) -> upstream.UpstreamResult:
+    return upstream.reconnect_upstream(prune_missing=args.prune_missing)
+
+
+def _handle_upstream_diagnostics(args: argparse.Namespace) -> upstream.UpstreamResult:
+    if args.diagnostics_action == "enable":
+        return upstream.set_diagnostics_enabled(True)
+    if args.diagnostics_action == "disable":
+        return upstream.set_diagnostics_enabled(False)
+    payload = upstream.diagnostics_status()
+    return upstream.UpstreamResult(payload=payload, exit_code=int(payload.get("exit_code", 0) or 0))
+
+
+def _handle_upstream_prefer_recovery(args: argparse.Namespace) -> upstream.UpstreamResult:
+    payload = {"status": "ok", "exit_code": 0, "mode": upstream.update_mode(prefer_recovery=args.state == "enable")}
+    return upstream.UpstreamResult(payload=payload, exit_code=0)
 
 
 def _handle_upstream_activate(args: argparse.Namespace) -> upstream.UpstreamResult:
@@ -257,6 +343,12 @@ def _handle_init(args: argparse.Namespace) -> init.InitResult:
         enable_web=not args.disable_web,
         redirect=args.redirect,
         target=args.target,
+        recovery_ssid=args.recovery_ssid,
+        recovery_password=args.recovery_password,
+        primary_ssid=args.primary_ssid,
+        primary_password=args.primary_password,
+        secondary_ssid=args.secondary_ssid,
+        secondary_password=args.secondary_password,
     )
 
 
@@ -292,8 +384,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         exit_code = _run(_handle_dns_update, args)
     elif args.domain == "dns" and args.action == "menu":
         exit_code = _run(_handle_dns_menu, args)
+    elif args.domain == "upstream" and args.action == "status":
+        exit_code = _run(_handle_upstream_status, args)
+    elif args.domain == "upstream" and args.action == "update":
+        exit_code = _run(_handle_upstream_update, args)
     elif args.domain == "upstream" and args.action == "apply":
         exit_code = _run(_handle_upstream_apply, args)
+    elif args.domain == "upstream" and args.action == "reconnect":
+        exit_code = _run(_handle_upstream_reconnect, args)
+    elif args.domain == "upstream" and args.action == "diagnostics":
+        exit_code = _run(_handle_upstream_diagnostics, args)
+    elif args.domain == "upstream" and args.action == "prefer-recovery":
+        exit_code = _run(_handle_upstream_prefer_recovery, args)
     elif args.domain == "upstream" and args.action == "activate":
         exit_code = _run(_handle_upstream_activate, args)
     elif args.domain == "upstream" and args.action == "forget":

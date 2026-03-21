@@ -1,4 +1,4 @@
-"""Persistence helpers for upstream Wi-Fi network profiles."""
+"""Persistence, actuation, and diagnostics helpers for upstream Wi-Fi profiles."""
 
 from __future__ import annotations
 
@@ -7,14 +7,15 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 from .agent import AgentProcessResult
 from .common import load_json, response_payload, save_json
+from .paths import CONFIG_DIR, LOG_DIR
 from . import privileges
-from .paths import CONFIG_DIR
 
 UPSTREAM_NETWORKS_JSON = CONFIG_DIR / "upstream_networks.json"
 LEGACY_UPSTREAM_JSON = CONFIG_DIR / "upstream_wifi.json"
@@ -22,8 +23,12 @@ UPSTREAM_INTERFACE = os.environ.get("MCBRIDGE_UPSTREAM_INTERFACE", "wlan0")
 UPSTREAM_WPA_SUPPLICANT_CONF = Path(
     os.environ.get("MCBRIDGE_UPSTREAM_WPA_CONF", f"/etc/wpa_supplicant/wpa_supplicant-{UPSTREAM_INTERFACE}.conf")
 )
+UPSTREAM_DIAGNOSTICS_JSON = LOG_DIR / "upstream-diagnostics.json"
 LOG = logging.getLogger(__name__)
 WIFI_TYPES = {"wifi", "802-11-wireless", "802.11-wireless", "wireless"}
+UPSTREAM_ROLES = {"recovery", "primary", "secondary"}
+DEFAULT_ROLE = "secondary"
+ROLE_WEIGHTS = {"recovery": 3000, "primary": 2000, "secondary": 1000}
 
 
 @dataclass
@@ -32,10 +37,48 @@ class UpstreamProfile:
     password: str
     priority: int
     security: str
+    role: str = DEFAULT_ROLE
+    enabled: bool = True
+    autoconnect: bool = True
 
     @property
     def has_password(self) -> bool:
         return bool(self.password)
+
+
+@dataclass
+class UpstreamMode:
+    prefer_recovery: bool = False
+    diagnostics_enabled: bool = False
+
+
+@dataclass
+class DiscoveredProfile:
+    ssid: str
+    priority: int
+    security: str
+    password: str = ""
+    psk: str | None = None
+    source: str | None = None
+    password_missing: bool = False
+
+    @property
+    def has_password(self) -> bool:
+        return not self.password_missing and bool(self.password or self.psk)
+
+    @property
+    def prepared_password(self) -> str:
+        return (self.psk or self.password) or ""
+
+
+@dataclass
+class UpstreamResult:
+    payload: Mapping[str, Any]
+    exit_code: int
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _profile_key(ssid: str) -> str:
@@ -70,10 +113,29 @@ def _validate_security(security: Any) -> str:
         return "open"
     if not isinstance(security, str):
         raise ValueError("security must be a string.")
-    cleaned = security.strip()
+    cleaned = security.strip().lower()
     if not cleaned:
         raise ValueError("security is required.")
     return cleaned
+
+
+def _validate_role(role: Any, *, default: str = DEFAULT_ROLE) -> str:
+    if role is None:
+        return default
+    if not isinstance(role, str):
+        raise ValueError("role must be a string.")
+    cleaned = role.strip().lower()
+    if cleaned not in UPSTREAM_ROLES:
+        raise ValueError("role must be one of recovery, primary, or secondary.")
+    return cleaned
+
+
+def _validate_bool(value: Any, field: str, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field} must be a boolean.")
 
 
 def _normalize_password(password: Any) -> str:
@@ -92,6 +154,10 @@ def _derive_psk(ssid: str, password: str) -> str:
     return hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), ssid.encode("utf-8"), 4096, dklen=32).hex()
 
 
+def _requires_password(security: str) -> bool:
+    return _profile_key(security) not in {"open", "none"}
+
+
 def _prepare_psk(ssid: str, security: str, password: str, *, require: bool) -> str:
     cleaned_password = _normalize_password(password)
     if not _requires_password(security):
@@ -105,60 +171,88 @@ def _prepare_psk(ssid: str, security: str, password: str, *, require: bool) -> s
     return _derive_psk(ssid, cleaned_password)
 
 
-def _requires_password(security: str) -> bool:
-    return _profile_key(security) not in {"open", "none"}
-
-
 def _load_raw(path: Path) -> Mapping[str, Any]:
     return load_json(path, default={})
 
 
-def _load_profiles(path: Path | None = None, warnings: list[str] | None = None) -> tuple[list[UpstreamProfile], Path]:
+def _default_role_for_index(index: int) -> str:
+    return "primary" if index == 0 else "secondary"
+
+
+def _normalize_profile_entry(entry: Mapping[str, Any], *, index: int, warnings: list[str] | None = None) -> UpstreamProfile | None:
+    try:
+        ssid = _validate_ssid(entry.get("ssid"))
+        priority = _validate_priority(entry.get("priority"))
+        security = _validate_security(entry.get("security"))
+        role = _validate_role(entry.get("role"), default=_default_role_for_index(index))
+        enabled = _validate_bool(entry.get("enabled"), "enabled", default=True)
+        autoconnect = _validate_bool(entry.get("autoconnect"), "autoconnect", default=True)
+        password = _prepare_psk(ssid, security, entry.get("password", ""), require=False)
+        if _requires_password(security) and not password:
+            if warnings is not None:
+                warnings.append(f"password missing for secured SSID {ssid}")
+            return None
+        return UpstreamProfile(
+            ssid=ssid,
+            password=password,
+            priority=priority,
+            security=security,
+            role=role,
+            enabled=enabled,
+            autoconnect=autoconnect,
+        )
+    except ValueError as exc:
+        if warnings is not None:
+            warnings.append(str(exc))
+        return None
+
+
+def _normalize_mode(raw_mode: Any) -> UpstreamMode:
+    if not isinstance(raw_mode, Mapping):
+        return UpstreamMode()
+    return UpstreamMode(
+        prefer_recovery=bool(raw_mode.get("prefer_recovery", False)),
+        diagnostics_enabled=bool(raw_mode.get("diagnostics_enabled", False)),
+    )
+
+
+def _normalized_config(path: Path | None = None, warnings: list[str] | None = None) -> tuple[list[UpstreamProfile], UpstreamMode, Path]:
     storage_path = path or UPSTREAM_NETWORKS_JSON
     raw_config = _load_raw(storage_path)
-
     if not raw_config and not storage_path.exists() and path is None:
         legacy = _load_raw(LEGACY_UPSTREAM_JSON)
         if isinstance(legacy, Mapping) and legacy:
             raw_config = legacy
 
     profiles: list[UpstreamProfile] = []
+    mode = UpstreamMode()
     if isinstance(raw_config, Mapping):
-        for entry in raw_config.get("profiles", []) or []:
-            if not isinstance(entry, Mapping):
-                continue
-            try:
-                ssid = _validate_ssid(entry.get("ssid"))
-                priority = _validate_priority(entry.get("priority"))
-                security = _validate_security(entry.get("security"))
-                password = _prepare_psk(ssid, security, entry.get("password", ""), require=False)
-                if _requires_password(security) and not password:
-                    if warnings is not None:
-                        warnings.append(f"password missing for secured SSID {ssid}")
+        mode = _normalize_mode(raw_config.get("mode"))
+        raw_profiles = raw_config.get("profiles", []) or []
+        if isinstance(raw_profiles, Sequence):
+            for index, entry in enumerate(raw_profiles):
+                if not isinstance(entry, Mapping):
                     continue
-            except ValueError as exc:
-                if warnings is not None:
-                    warnings.append(str(exc))
-                continue
-            profiles.append(
-                UpstreamProfile(
-                    ssid=ssid,
-                    password=password,
-                    priority=priority,
-                    security=security,
-                )
-            )
-    return profiles, storage_path
+                profile = _normalize_profile_entry(entry, index=index, warnings=warnings)
+                if profile is not None:
+                    profiles.append(profile)
+    return _sorted_profiles(profiles), mode, storage_path
 
 
 def load_profiles(path: Path | None = None, *, warnings: list[str] | None = None) -> list[UpstreamProfile]:
-    profiles, storage_path = _load_profiles(path, warnings)
+    profiles, _, storage_path = _normalized_config(path, warnings)
     if not profiles and path is None and storage_path.exists():
         return []
-    return _sorted_profiles(profiles)
+    return profiles
 
 
-def _save_profiles(profiles: Sequence[UpstreamProfile], path: Path) -> None:
+def load_mode(path: Path | None = None) -> UpstreamMode:
+    _, mode, _ = _normalized_config(path)
+    return mode
+
+
+def _save_profiles(profiles: Sequence[UpstreamProfile], path: Path, *, mode: UpstreamMode | None = None) -> None:
+    current_mode = mode if mode is not None else load_mode(path)
     payload: MutableMapping[str, Any] = {
         "profiles": [
             {
@@ -166,29 +260,57 @@ def _save_profiles(profiles: Sequence[UpstreamProfile], path: Path) -> None:
                 "password": profile.password,
                 "priority": profile.priority,
                 "security": profile.security,
+                "role": profile.role,
+                "enabled": profile.enabled,
+                "autoconnect": profile.autoconnect,
             }
             for profile in profiles
-        ]
+        ],
+        "mode": asdict(current_mode),
     }
     save_json(path, payload)
 
 
-def _sorted_profiles(profiles: Iterable[UpstreamProfile]) -> list[UpstreamProfile]:
-    return sorted(profiles, key=lambda profile: (-profile.priority, profile.ssid.lower()))
+def update_mode(
+    *,
+    prefer_recovery: bool | None = None,
+    diagnostics_enabled: bool | None = None,
+    path: Path | None = None,
+) -> dict[str, object]:
+    profiles, mode, storage_path = _normalized_config(path)
+    if prefer_recovery is not None:
+        mode.prefer_recovery = bool(prefer_recovery)
+    if diagnostics_enabled is not None:
+        mode.diagnostics_enabled = bool(diagnostics_enabled)
+    _save_profiles(profiles, storage_path, mode=mode)
+    return asdict(mode)
+
+
+def _priority_sort_key(profile: UpstreamProfile) -> tuple[int, int, str]:
+    return (ROLE_WEIGHTS.get(profile.role, 0), profile.priority, profile.ssid.lower())
+
+
+def _sorted_profiles(profiles: Iterable[UpstreamProfile | DiscoveredProfile]) -> list[Any]:
+    return sorted(profiles, key=lambda profile: (-int(getattr(profile, "priority", 0)), getattr(profile, "ssid", "").lower()))
+
+
+def _sorted_profiles_with_roles(profiles: Iterable[UpstreamProfile]) -> list[UpstreamProfile]:
+    return sorted(profiles, key=lambda profile: (-ROLE_WEIGHTS.get(profile.role, 0), -profile.priority, profile.ssid.lower()))
 
 
 def _annotate_profiles(profiles: Sequence[UpstreamProfile]) -> list[dict[str, object]]:
-    annotated: list[dict[str, object]] = []
-    for profile in profiles:
-        annotated.append(
-            {
-                "ssid": profile.ssid,
-                "priority": profile.priority,
-                "security": profile.security,
-                "has_password": profile.has_password,
-            }
-        )
-    return annotated
+    return [
+        {
+            "ssid": profile.ssid,
+            "priority": profile.priority,
+            "security": profile.security,
+            "role": profile.role,
+            "enabled": profile.enabled,
+            "autoconnect": profile.autoconnect,
+            "has_password": profile.has_password,
+        }
+        for profile in profiles
+    ]
 
 
 def _inject_saved_passwords(
@@ -207,21 +329,30 @@ def _inject_saved_passwords(
 
 
 def list_profiles(path: Path | None = None) -> list[dict[str, object]]:
-    profiles, storage_path = _load_profiles(path)
+    profiles, _, storage_path = _normalized_config(path)
     if not profiles and path is None and storage_path.exists():
         return []
-    return _annotate_profiles(_sorted_profiles(profiles))
+    return _annotate_profiles(_sorted_profiles_with_roles(profiles))
 
 
 def add_profile(
-    *, ssid: str, password: str, priority: int, security: str, path: Path | None = None
+    *,
+    ssid: str,
+    password: str,
+    priority: int,
+    security: str,
+    role: str = DEFAULT_ROLE,
+    enabled: bool = True,
+    autoconnect: bool = True,
+    path: Path | None = None,
 ) -> list[dict[str, object]]:
     cleaned_ssid = _validate_ssid(ssid)
     cleaned_security = _validate_security(security)
     cleaned_priority = _validate_priority(priority)
+    cleaned_role = _validate_role(role)
     cleaned_password = _prepare_psk(cleaned_ssid, cleaned_security, password, require=True)
 
-    profiles, storage_path = _load_profiles(path)
+    profiles, mode, storage_path = _normalized_config(path)
     key = _profile_key(cleaned_ssid)
     if any(_profile_key(profile.ssid) == key for profile in profiles):
         raise ValueError(f"SSID {cleaned_ssid} already exists.")
@@ -232,11 +363,13 @@ def add_profile(
             password=cleaned_password,
             priority=cleaned_priority,
             security=cleaned_security,
+            role=cleaned_role,
+            enabled=bool(enabled),
+            autoconnect=bool(autoconnect),
         )
     )
-
-    sorted_profiles = _sorted_profiles(profiles)
-    _save_profiles(sorted_profiles, storage_path)
+    sorted_profiles = _sorted_profiles_with_roles(profiles)
+    _save_profiles(sorted_profiles, storage_path, mode=mode)
     return _annotate_profiles(sorted_profiles)
 
 
@@ -246,68 +379,61 @@ def update_profile(
     password: str | None = None,
     priority: int | None = None,
     security: str | None = None,
+    role: str | None = None,
+    enabled: bool | None = None,
+    autoconnect: bool | None = None,
     path: Path | None = None,
 ) -> list[dict[str, object]]:
     cleaned_ssid = _validate_ssid(ssid)
-    profiles, storage_path = _load_profiles(path)
+    profiles, mode, storage_path = _normalized_config(path)
     key = _profile_key(cleaned_ssid)
     existing = next((profile for profile in profiles if _profile_key(profile.ssid) == key), None)
     if existing is None:
         raise ValueError(f"SSID {cleaned_ssid} was not found.")
-
-    if priority is None and security is None and password is None:
+    if priority is None and security is None and password is None and role is None and enabled is None and autoconnect is None:
         raise ValueError("No fields to update.")
 
     if priority is not None:
         existing.priority = _validate_priority(priority)
     if security is not None:
         existing.security = _validate_security(security)
+    if role is not None:
+        existing.role = _validate_role(role)
+    if enabled is not None:
+        existing.enabled = bool(enabled)
+    if autoconnect is not None:
+        existing.autoconnect = bool(autoconnect)
     if password is not None:
         existing.password = _prepare_psk(existing.ssid, existing.security, password, require=True)
-
     if _requires_password(existing.security) and not existing.password:
         raise ValueError("password is required for secured networks.")
 
-    sorted_profiles = _sorted_profiles(profiles)
-    _save_profiles(sorted_profiles, storage_path)
+    sorted_profiles = _sorted_profiles_with_roles(profiles)
+    _save_profiles(sorted_profiles, storage_path, mode=mode)
     return _annotate_profiles(sorted_profiles)
 
 
-def remove_profile(*, ssid: str, path: Path | None = None) -> list[dict[str, object]]:
+def remove_profile(*, ssid: str, path: Path | None = None, force: bool = False) -> list[dict[str, object]]:
     cleaned_ssid = _validate_ssid(ssid)
-    profiles, storage_path = _load_profiles(path)
+    profiles, mode, storage_path = _normalized_config(path)
     key = _profile_key(cleaned_ssid)
-    remaining = [profile for profile in profiles if _profile_key(profile.ssid) != key]
-
-    if len(remaining) == len(profiles):
+    existing = next((profile for profile in profiles if _profile_key(profile.ssid) == key), None)
+    if existing is None:
         raise ValueError(f"SSID {cleaned_ssid} was not found.")
-
-    sorted_profiles = _sorted_profiles(remaining)
-    _save_profiles(sorted_profiles, storage_path)
+    if existing.role == "recovery" and not force:
+        raise ValueError("Recovery upstream profiles require force removal.")
+    remaining = [profile for profile in profiles if _profile_key(profile.ssid) != key]
+    sorted_profiles = _sorted_profiles_with_roles(remaining)
+    _save_profiles(sorted_profiles, storage_path, mode=mode)
     return _annotate_profiles(sorted_profiles)
-
-
-@dataclass
-class DiscoveredProfile:
-    ssid: str
-    priority: int
-    security: str
-    password: str = ""
-    psk: str | None = None
-    source: str | None = None
-    password_missing: bool = False
-
-    @property
-    def has_password(self) -> bool:
-        return not self.password_missing and bool(self.password or self.psk)
-
-    @property
-    def prepared_password(self) -> str:
-        return (self.psk or self.password) or ""
 
 
 def _run_nmcli(args: Sequence[str]) -> subprocess.CompletedProcess[str] | AgentProcessResult:
     return privileges.sudo_run(["nmcli", *args], check=False, text=True)
+
+
+def _run_ip(args: Sequence[str]) -> subprocess.CompletedProcess[str] | AgentProcessResult:
+    return privileges.sudo_run(["ip", *args], check=False, text=True)
 
 
 def _parse_priority(value: Any, *, fallback: int = 1) -> int:
@@ -361,8 +487,7 @@ def _parse_wpa_supplicant(path: Path) -> tuple[list[DiscoveredProfile], list[str
                     in_network = False
                     continue
                 priority = _parse_priority(current.get("priority"), fallback=1)
-                key_mgmt = current.get("key_mgmt")
-                security = _security_from_keymgmt(key_mgmt)
+                security = _security_from_keymgmt(current.get("key_mgmt"))
                 raw_password = current.get("psk", "")
                 prepared_psk = _prepare_psk(cleaned_ssid, security, raw_password, require=False)
                 password_missing = not prepared_psk and _requires_password(security)
@@ -401,20 +526,19 @@ def _parse_nmcli_wifi() -> tuple[list[DiscoveredProfile], list[str], dict[str, o
 
     details["available"] = True
     if list_result.returncode != 0:
-        message = list_result.stderr.strip() or "nmcli connection list failed"
+        message = (list_result.stderr or "").strip() or "nmcli connection list failed"
         warnings.append(message)
         details["error"] = message
         details["returncode"] = list_result.returncode
         return [], warnings, details
 
     wifi_connections = []
-    for line in list_result.stdout.splitlines():
+    for line in (list_result.stdout or "").splitlines():
         parts = line.split(":", 1)
         if len(parts) != 2:
             continue
         name, conn_type = parts
-        conn_type_lower = (conn_type or "").strip().lower()
-        if conn_type_lower in WIFI_TYPES:
+        if (conn_type or "").strip().lower() in WIFI_TYPES:
             wifi_connections.append(name.strip())
 
     profiles: list[DiscoveredProfile] = []
@@ -429,9 +553,9 @@ def _parse_nmcli_wifi() -> tuple[list[DiscoveredProfile], list[str], dict[str, o
             ]
         )
         if detail_result.returncode != 0:
-            warnings.append(f"nmcli failed for {connection}: {detail_result.stderr.strip() or 'unknown error'}")
+            warnings.append(f"nmcli failed for {connection}: {(detail_result.stderr or '').strip() or 'unknown error'}")
             continue
-        ssid, key_mgmt, priority, password = ((detail_result.stdout.splitlines() + ["", "", "", ""])[:4])
+        ssid, key_mgmt, priority, password = ((detail_result.stdout or "").splitlines() + ["", "", "", ""])[:4]
         cleaned_ssid = ssid or connection
         security = _security_from_keymgmt(key_mgmt)
         prepared_psk = _prepare_psk(cleaned_ssid, security, password, require=False)
@@ -467,20 +591,12 @@ def _key_mgmt_for_security(security: str) -> str:
     return "none"
 
 
-def _nmcli_stdout(
-    result: subprocess.CompletedProcess[str] | AgentProcessResult | None,
-) -> str:
-    if result is None:
-        return ""
-    return (result.stdout or "").strip()
+def _nmcli_stdout(result: subprocess.CompletedProcess[str] | AgentProcessResult | None) -> str:
+    return "" if result is None else (result.stdout or "").strip()
 
 
-def _nmcli_stderr(
-    result: subprocess.CompletedProcess[str] | AgentProcessResult | None,
-) -> str:
-    if result is None:
-        return ""
-    return (result.stderr or "").strip()
+def _nmcli_stderr(result: subprocess.CompletedProcess[str] | AgentProcessResult | None) -> str:
+    return "" if result is None else (result.stderr or "").strip()
 
 
 def _parse_nmcli_line(line: str, *, expected: int) -> list[str]:
@@ -506,15 +622,11 @@ def _parse_nmcli_line(line: str, *, expected: int) -> list[str]:
     return parts[:expected]
 
 
-def _scan_nmcli_wifi(
-    interface: str, active_ssid: str | None
-) -> tuple[dict[str, dict[str, object]], list[str], dict[str, object]]:
+def _scan_nmcli_wifi(interface: str, active_ssid: str | None) -> tuple[dict[str, dict[str, object]], list[str], dict[str, object]]:
     warnings: list[str] = []
     details: dict[str, object] = {"available": False, "interface": interface}
     try:
-        result = _run_nmcli(
-            ["-t", "-f", "SSID,SIGNAL,IN-USE,SECURITY,DEVICE", "dev", "wifi", "list", "ifname", interface]
-        )
+        result = _run_nmcli(["-t", "-f", "SSID,SIGNAL,IN-USE,SECURITY,DEVICE", "dev", "wifi", "list", "ifname", interface])
     except (FileNotFoundError, PermissionError) as exc:
         warnings.append(f"nmcli unavailable; unable to scan Wi-Fi: {exc}")
         details["error"] = str(exc)
@@ -532,13 +644,9 @@ def _scan_nmcli_wifi(
     active_key = _profile_key(active_ssid or "")
     for line in _nmcli_stdout(result).splitlines():
         ssid, signal, in_use, security, device = _parse_nmcli_line(line, expected=5)
-        if not ssid:
-            continue
-        if device and device != interface:
+        if not ssid or (device and device != interface):
             continue
         key = _profile_key(ssid)
-        if not key:
-            continue
         try:
             signal_value = int(signal.strip())
         except (TypeError, ValueError):
@@ -551,7 +659,6 @@ def _scan_nmcli_wifi(
             "active": active,
             "security": security.strip(),
         }
-
     details["count"] = len(scan_map)
     return scan_map, warnings, details
 
@@ -566,10 +673,7 @@ def _list_nmcli_wifi_connections() -> tuple[dict[str, tuple[str, str]], list[str
     ssid_map: dict[str, tuple[str, str]] = {}
     for line in _nmcli_stdout(result).splitlines():
         name, conn_type = (line.split(":", 1) + [""])[:2]
-        if not name:
-            continue
-        conn_type_lower = conn_type.strip().lower()
-        if conn_type_lower not in WIFI_TYPES:
+        if not name or conn_type.strip().lower() not in WIFI_TYPES:
             continue
         detail = _run_nmcli(["-g", "802-11-wireless.ssid", "connection", "show", name])
         if detail.returncode != 0:
@@ -594,23 +698,16 @@ def _active_upstream_details(interface: str) -> tuple[str | None, str | None, li
     active_connection = None
     for line in _nmcli_stdout(result).splitlines():
         device, conn_type, state, connection = (line.split(":", 3) + ["", "", "", ""])[:4]
-        if device.strip() != interface:
-            continue
-        if conn_type.strip().lower() not in WIFI_TYPES:
+        if device.strip() != interface or conn_type.strip().lower() not in WIFI_TYPES:
             continue
         if state.strip().lower() not in {"connected", "connecting", "activated"}:
             continue
         active_connection = connection.strip() or None
         break
-
     if not active_connection:
         return None, None, errors
 
-    try:
-        detail = _run_nmcli(["-g", "802-11-wireless.ssid", "connection", "show", active_connection])
-    except Exception as exc:
-        errors.append(f"nmcli connection show failed for {active_connection}: {exc}")
-        return None, active_connection, errors
+    detail = _run_nmcli(["-g", "802-11-wireless.ssid", "connection", "show", active_connection])
     if detail.returncode != 0:
         errors.append(_nmcli_stderr(detail) or f"nmcli connection show failed for {active_connection}")
         return None, active_connection, errors
@@ -623,15 +720,7 @@ def _active_upstream_connection(interface: str) -> tuple[str | None, list[str]]:
     return ssid, errors
 
 
-@dataclass
-class UpstreamResult:
-    payload: Mapping[str, Any]
-    exit_code: int
-
-
-def _safe_nmcli(
-    args: Sequence[str], *, errors: list[str], context: str
-) -> subprocess.CompletedProcess[str] | AgentProcessResult | None:
+def _safe_nmcli(args: Sequence[str], *, errors: list[str], context: str) -> subprocess.CompletedProcess[str] | AgentProcessResult | None:
     try:
         return _run_nmcli(args)
     except Exception as exc:
@@ -639,206 +728,334 @@ def _safe_nmcli(
         return None
 
 
+def _sanitize_text(value: str) -> str:
+    text = value or ""
+    text = re.sub(r"([Pp][Ss][Kk][^\n=:]*[=:]\s*)([^\s\n]+)", r"\1<redacted>", text)
+    text = re.sub(r"(password[^\n=:]*[=:]\s*)([^\s\n]+)", r"\1<redacted>", text)
+    return text
+
+
+def _load_diagnostics() -> dict[str, Any]:
+    data = load_json(UPSTREAM_DIAGNOSTICS_JSON, default={})
+    if not isinstance(data, Mapping):
+        data = {}
+    return {
+        "diagnostics_enabled": bool(data.get("diagnostics_enabled", False)),
+        "attempts": list(data.get("attempts", []) or []),
+        "last_success": data.get("last_success"),
+        "last_failure": data.get("last_failure"),
+    }
+
+
+def _save_diagnostics(data: Mapping[str, Any]) -> None:
+    save_json(UPSTREAM_DIAGNOSTICS_JSON, dict(data))
+
+
+def diagnostics_status() -> dict[str, object]:
+    payload = _load_diagnostics()
+    payload.setdefault("path", str(UPSTREAM_DIAGNOSTICS_JSON))
+    payload.setdefault("status", "ok")
+    payload.setdefault("exit_code", 0)
+    return payload
+
+
+def _record_diagnostics_attempt(attempt: Mapping[str, Any], *, success: bool) -> None:
+    data = _load_diagnostics()
+    attempts = list(data.get("attempts", []) or [])
+    attempts.append(dict(attempt))
+    data["attempts"] = attempts[-20:]
+    if success:
+        data["last_success"] = dict(attempt)
+    else:
+        data["last_failure"] = dict(attempt)
+    _save_diagnostics(data)
+
+
+def set_diagnostics_enabled(enabled: bool) -> UpstreamResult:
+    mode_payload = update_mode(diagnostics_enabled=enabled)
+    diag = _load_diagnostics()
+    diag["diagnostics_enabled"] = bool(enabled)
+    diag["updated_at"] = _now_iso()
+    _save_diagnostics(diag)
+    payload = {"status": "ok", "exit_code": 0, "mode": mode_payload, "diagnostics": diagnostics_status()}
+    return UpstreamResult(response_payload(payload, verbose=True), 0)
+
+
+def _connectivity_state() -> tuple[dict[str, object], list[dict[str, object]]]:
+    commands: list[dict[str, object]] = []
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str] | AgentProcessResult | None:
+        try:
+            if command and command[0] == "nmcli":
+                result = _run_nmcli(command[1:])
+            else:
+                result = _run_ip(command[1:])
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            commands.append({"command": list(command), "returncode": 127, "stdout": "", "stderr": _sanitize_text(str(exc))})
+            return None
+        commands.append(
+            {
+                "command": list(command),
+                "returncode": result.returncode,
+                "stdout": _sanitize_text(result.stdout or ""),
+                "stderr": _sanitize_text(result.stderr or ""),
+            }
+        )
+        return result
+
+    connectivity_result = run(["nmcli", "-t", "-f", "CONNECTIVITY", "general", "status"])
+    address_result = run(["ip", "-o", "-4", "addr", "show", "dev", UPSTREAM_INTERFACE])
+    route_result = run(["ip", "route", "show", "default", "dev", UPSTREAM_INTERFACE])
+
+    connectivity = (_nmcli_stdout(connectivity_result) or "unknown").splitlines()[0] if connectivity_result else "unknown"
+    has_ip = bool(((address_result.stdout if address_result else "") or "").strip())
+    has_route = bool(((route_result.stdout if route_result else "") or "").strip())
+    internet_reachable = connectivity in {"full"}
+    return (
+        {
+            "connectivity": connectivity,
+            "has_ip": has_ip,
+            "has_route": has_route,
+            "internet_reachable": internet_reachable,
+        },
+        commands,
+    )
+
+
+def _upstream_health(interface: str) -> tuple[dict[str, object], list[dict[str, object]], list[str]]:
+    errors: list[str] = []
+    active_ssid, active_errors = _active_upstream_connection(interface)
+    errors.extend(active_errors)
+    connectivity, commands = _connectivity_state()
+    associated = bool(active_ssid)
+    healthy = associated and bool(connectivity["has_ip"]) and bool(connectivity["has_route"]) and bool(connectivity["internet_reachable"])
+    payload = {
+        "active_ssid": active_ssid,
+        "associated": associated,
+        **connectivity,
+        "healthy": healthy,
+    }
+    return payload, commands, errors
+
+
+def _selection_buckets(profiles: Sequence[UpstreamProfile], scan_results: Mapping[str, Mapping[str, object]]) -> dict[str, list[UpstreamProfile]]:
+    available = [profile for profile in profiles if profile.enabled and scan_results.get(_profile_key(profile.ssid), {}).get("available")]
+    buckets: dict[str, list[UpstreamProfile]] = {"recovery": [], "primary": [], "secondary": [], "other": []}
+    for profile in sorted(available, key=lambda p: (-p.priority, p.ssid.lower())):
+        buckets[profile.role if profile.role in buckets else "other"].append(profile)
+    return buckets
+
+
+def _select_profile(
+    profiles: Sequence[UpstreamProfile],
+    mode: UpstreamMode,
+    scan_results: Mapping[str, Mapping[str, object]],
+) -> tuple[UpstreamProfile | None, list[dict[str, object]]]:
+    candidates = [profile for profile in profiles if profile.enabled]
+    available = [profile for profile in candidates if scan_results.get(_profile_key(profile.ssid), {}).get("available")]
+    reasons: list[dict[str, object]] = []
+
+    def pick(reason: str, subset: Sequence[UpstreamProfile]) -> UpstreamProfile | None:
+        if not subset:
+            reasons.append({"reason": reason, "selected": None})
+            return None
+        selected = sorted(subset, key=lambda p: (-p.priority, p.ssid.lower()))[0]
+        reasons.append({"reason": reason, "selected": selected.ssid})
+        return selected
+
+    recovery_available = [p for p in available if p.role == "recovery"]
+    if mode.prefer_recovery or mode.diagnostics_enabled:
+        selected = pick("prefer_recovery_or_diagnostics", recovery_available)
+        if selected:
+            return selected, reasons
+    selected = pick("primary_available", [p for p in available if p.role == "primary"])
+    if selected:
+        return selected, reasons
+    selected = pick("secondary_available", [p for p in available if p.role == "secondary"])
+    if selected:
+        return selected, reasons
+    remaining = [p for p in available if p.role not in {"primary", "secondary", "recovery"}] + list(recovery_available)
+    selected = pick("highest_priority_remaining", sorted(remaining, key=lambda p: (-p.priority, p.ssid.lower())))
+    if selected:
+        return selected, reasons
+    reasons.append({"reason": "no_upstream_available", "selected": None})
+    return None, reasons
+
+
+def _autoconnect_priority(profile: UpstreamProfile, mode: UpstreamMode) -> int:
+    value = profile.priority + ROLE_WEIGHTS.get(profile.role, 0)
+    if profile.role == "recovery" and not (mode.prefer_recovery or mode.diagnostics_enabled):
+        value -= 2500
+    return value
+
+
 def apply_upstream(
     path: Path | None = None,
     *,
     interface: str | None = None,
     prune_missing: bool = False,
+    force_reconnect: bool = False,
 ) -> UpstreamResult:
     warnings: list[str] = []
-    profiles = load_profiles(path, warnings=warnings)
+    profiles, mode, _ = _normalized_config(path, warnings)
     if not profiles:
-        payload = {
-            "status": "error",
-            "exit_code": 2,
-            "message": "No upstream Wi-Fi profiles saved.",
-            "warnings": warnings,
-        }
+        payload = {"status": "error", "exit_code": 2, "message": "No upstream Wi-Fi profiles saved.", "warnings": warnings}
         return UpstreamResult(response_payload(payload, verbose=True), 2)
 
     interface_name = interface or UPSTREAM_INTERFACE
     changes: list[dict[str, object]] = []
     errors: list[str] = []
+    diagnostics_commands: list[dict[str, object]] = []
+
     try:
         connection_map, list_errors = _list_nmcli_wifi_connections()
     except Exception as exc:
-        payload = {
-            "status": "error",
-            "exit_code": 3,
-            "message": f"Unable to query NetworkManager: {exc}",
-            "warnings": warnings,
-        }
+        payload = {"status": "error", "exit_code": 3, "message": f"Unable to query NetworkManager: {exc}", "warnings": warnings}
         return UpstreamResult(response_payload(payload, verbose=True), 3)
-
     errors.extend(list_errors)
-
-    sorted_profiles = _sorted_profiles(profiles)
-    stored_keys = {_profile_key(profile.ssid) for profile in sorted_profiles}
-    all_connection_names = {connection_name for connection_name, _ in connection_map.values()}
-    saved_connection_names = {
-        connection_name for key, (connection_name, _) in connection_map.items() if key in stored_keys
-    }
 
     active_ssid, active_connection_name, active_errors = _active_upstream_details(interface_name)
     errors.extend(active_errors)
-    active_key = _profile_key(active_ssid or "")
-    prune_allowed = prune_missing and not active_errors
-    if prune_missing and active_errors:
-        warnings.append("Skipping prune_missing because active connection could not be determined.")
+    scan_results, scan_warnings, scan_details = _scan_nmcli_wifi(interface_name, active_ssid)
+    warnings.extend(scan_warnings)
+    selected_profile, selection_reasons = _select_profile(_sorted_profiles_with_roles(profiles), mode, scan_results)
 
-    if prune_allowed:
+    attempt: dict[str, Any] = {
+        "timestamp": _now_iso(),
+        "interface": interface_name,
+        "mode": asdict(mode),
+        "active_before": active_ssid,
+        "selection_reasons": selection_reasons,
+        "scan": {"count": scan_details.get("count", 0)},
+        "candidate_profiles": [
+            {
+                "ssid": profile.ssid,
+                "role": profile.role,
+                "enabled": profile.enabled,
+                "priority": profile.priority,
+                "available": bool(scan_results.get(_profile_key(profile.ssid), {}).get("available")),
+                "signal_strength": scan_results.get(_profile_key(profile.ssid), {}).get("signal_percent"),
+            }
+            for profile in _sorted_profiles_with_roles(profiles)
+        ],
+    }
+
+    stored_keys = {_profile_key(profile.ssid) for profile in profiles}
+    saved_connection_names = {connection_name for key, (connection_name, _) in connection_map.items() if key in stored_keys}
+    if prune_missing and not active_errors:
         for key, (connection_name, ssid) in sorted(connection_map.items(), key=lambda item: item[0]):
-            if key in stored_keys:
+            if key in stored_keys or connection_name in saved_connection_names or connection_name == active_connection_name:
                 continue
-            if connection_name in saved_connection_names:
-                continue
-            if active_connection_name and connection_name == active_connection_name:
-                changes.append(
-                    {
-                        "ssid": ssid,
-                        "action": "prune_skipped_active",
-                        "connection": connection_name,
-                    }
-                )
-                continue
-            if active_key and key == active_key:
-                changes.append(
-                    {
-                        "ssid": ssid,
-                        "action": "prune_skipped_active",
-                        "connection": connection_name,
-                    }
-                )
-                continue
-            try:
-                delete_result = _run_nmcli(["connection", "delete", connection_name])
-            except Exception as exc:
-                errors.append(f"Failed to delete {connection_name}: {exc}")
-                continue
-            if delete_result.returncode != 0:
-                errors.append(_nmcli_stderr(delete_result) or f"Failed to delete {connection_name}")
+            delete_result = _safe_nmcli(["connection", "delete", connection_name], errors=errors, context=f"Failed to delete {connection_name}")
+            if delete_result is not None:
+                diagnostics_commands.append({"command": ["nmcli", "connection", "delete", connection_name], "returncode": delete_result.returncode, "stdout": _sanitize_text(delete_result.stdout or ""), "stderr": _sanitize_text(delete_result.stderr or "")})
+            if delete_result is None or delete_result.returncode != 0:
+                if delete_result is not None:
+                    errors.append(_nmcli_stderr(delete_result) or f"Failed to delete {connection_name}")
                 continue
             changes.append({"ssid": ssid, "action": "deleted", "connection": connection_name})
 
-    for profile in sorted_profiles:
+    for profile in _sorted_profiles_with_roles(profiles):
         key = _profile_key(profile.ssid)
         connection_name = connection_map.get(key, (profile.ssid, profile.ssid))[0]
-        created = connection_name not in all_connection_names
-        if created:
-            result = _safe_nmcli(
-                [
-                    "connection",
-                    "add",
-                    "type",
-                    "wifi",
-                    "ifname",
-                    interface_name,
-                    "con-name",
-                    connection_name,
-                    "ssid",
-                    profile.ssid,
-                ],
-                errors=errors,
-                context=f"Failed to create connection for {profile.ssid}",
-            )
-            if result is None:
-                continue
-            if result.returncode != 0:
-                errors.append(_nmcli_stderr(result) or f"Failed to create connection for {profile.ssid}")
+        if connection_name not in {name for name, _ssid in connection_map.values()}:
+            add_result = _safe_nmcli([
+                "connection", "add", "type", "wifi", "ifname", interface_name, "con-name", connection_name, "ssid", profile.ssid
+            ], errors=errors, context=f"Failed to create connection for {profile.ssid}")
+            if add_result is not None:
+                diagnostics_commands.append({"command": ["nmcli", "connection", "add", "type", "wifi", "ifname", interface_name, "con-name", connection_name, "ssid", profile.ssid], "returncode": add_result.returncode, "stdout": _sanitize_text(add_result.stdout or ""), "stderr": _sanitize_text(add_result.stderr or "")})
+            if add_result is None or add_result.returncode != 0:
+                if add_result is not None:
+                    errors.append(_nmcli_stderr(add_result) or f"Failed to create connection for {profile.ssid}")
                 continue
             changes.append({"ssid": profile.ssid, "action": "created", "connection": connection_name})
-        elif connection_name != profile.ssid:
-            rename = _safe_nmcli(
-                ["connection", "modify", connection_name, "connection.id", profile.ssid],
-                errors=errors,
-                context=f"Failed to rename {connection_name} to {profile.ssid}",
-            )
-            if rename is not None and rename.returncode == 0:
-                changes.append(
-                    {
-                        "ssid": profile.ssid,
-                        "action": "renamed",
-                        "connection": profile.ssid,
-                        "previous": connection_name,
-                    }
-                )
-                connection_name = profile.ssid
-            else:
-                if rename is not None:
-                    errors.append(_nmcli_stderr(rename) or f"Failed to rename {connection_name} to {profile.ssid}")
 
         key_mgmt = _key_mgmt_for_security(profile.security)
         modify_args = [
-            "connection",
-            "modify",
-            connection_name,
-            "connection.autoconnect",
-            "yes",
-            "connection.autoconnect-priority",
-            str(profile.priority),
-            "connection.interface-name",
-            interface_name,
-            "802-11-wireless.ssid",
-            profile.ssid,
-            "802-11-wireless-security.key-mgmt",
-            key_mgmt,
+            "connection", "modify", connection_name,
+            "connection.autoconnect", "yes" if (profile.enabled and profile.autoconnect) else "no",
+            "connection.autoconnect-priority", str(_autoconnect_priority(profile, mode)),
+            "connection.interface-name", interface_name,
+            "802-11-wireless.ssid", profile.ssid,
+            "802-11-wireless-security.key-mgmt", key_mgmt,
         ]
         if _requires_password(profile.security):
-            modify_args += [
-                "802-11-wireless-security.psk",
-                profile.password,
-                "802-11-wireless-security.psk-flags",
-                "0",
-            ]
+            modify_args += ["802-11-wireless-security.psk", profile.password, "802-11-wireless-security.psk-flags", "0"]
         else:
             modify_args += ["802-11-wireless-security.psk", ""]
-        modify = _safe_nmcli(modify_args, errors=errors, context=f"Failed to update {profile.ssid}")
-        if modify is None:
+        modify_result = _safe_nmcli(modify_args, errors=errors, context=f"Failed to update {profile.ssid}")
+        if modify_result is not None:
+            diagnostics_commands.append({"command": ["nmcli", *modify_args], "returncode": modify_result.returncode, "stdout": _sanitize_text(modify_result.stdout or ""), "stderr": _sanitize_text(modify_result.stderr or "")})
+        if modify_result is None or modify_result.returncode != 0:
+            if modify_result is not None:
+                errors.append(_nmcli_stderr(modify_result) or f"Failed to update {profile.ssid}")
             continue
-        if modify.returncode != 0:
-            errors.append(_nmcli_stderr(modify) or f"Failed to update {profile.ssid}")
-            continue
-        if not created:
-            changes.append({"ssid": profile.ssid, "action": "updated", "connection": connection_name})
+        changes.append({"ssid": profile.ssid, "action": "updated", "connection": connection_name, "role": profile.role})
 
-    preferred = sorted_profiles[0]
-    connect_result = _safe_nmcli(
-        ["connection", "up", preferred.ssid, "ifname", interface_name],
-        errors=errors,
-        context=f"Failed to activate {preferred.ssid}",
-    )
-    if connect_result is None:
-        pass
-    elif connect_result.returncode != 0:
-        errors.append(_nmcli_stderr(connect_result) or f"Failed to activate {preferred.ssid}")
+    if force_reconnect:
+        down_result = _safe_nmcli(["device", "disconnect", interface_name], errors=errors, context=f"Failed to disconnect {interface_name}")
+        if down_result is not None:
+            diagnostics_commands.append({"command": ["nmcli", "device", "disconnect", interface_name], "returncode": down_result.returncode, "stdout": _sanitize_text(down_result.stdout or ""), "stderr": _sanitize_text(down_result.stderr or "")})
+
+    if selected_profile is not None:
+        connect_result = _safe_nmcli(["connection", "up", selected_profile.ssid, "ifname", interface_name], errors=errors, context=f"Failed to activate {selected_profile.ssid}")
+        if connect_result is not None:
+            diagnostics_commands.append({"command": ["nmcli", "connection", "up", selected_profile.ssid, "ifname", interface_name], "returncode": connect_result.returncode, "stdout": _sanitize_text(connect_result.stdout or ""), "stderr": _sanitize_text(connect_result.stderr or "")})
+        if connect_result is None or connect_result.returncode != 0:
+            if connect_result is not None:
+                errors.append(_nmcli_stderr(connect_result) or f"Failed to activate {selected_profile.ssid}")
+        else:
+            changes.append({"ssid": selected_profile.ssid, "action": "activated", "connection": selected_profile.ssid, "role": selected_profile.role})
     else:
-        changes.append({"ssid": preferred.ssid, "action": "activated", "connection": preferred.ssid})
+        warnings.append("No upstream available.")
 
-    active_ssid, active_errors = _active_upstream_connection(interface_name)
-    errors.extend(active_errors)
+    health, health_commands, health_errors = _upstream_health(interface_name)
+    diagnostics_commands.extend(health_commands)
+    errors.extend(health_errors)
 
     status = "ok"
     exit_code = 0
     if errors:
         status = "error"
         exit_code = 3
-    elif warnings:
+    elif warnings or not health["healthy"]:
         status = "warning"
-        exit_code = 0
+
+    attempt.update({
+        "selected_profile": selected_profile.ssid if selected_profile else None,
+        "selected_role": selected_profile.role if selected_profile else None,
+        "health": health,
+        "commands": diagnostics_commands,
+        "warnings": warnings,
+        "errors": errors,
+    })
+    _record_diagnostics_attempt(attempt, success=exit_code == 0 and bool(health["healthy"]))
 
     payload = {
         "status": status,
         "exit_code": exit_code,
         "interface": interface_name,
-        "active_ssid": active_ssid,
+        "active_ssid": health.get("active_ssid"),
+        "selected_profile": selected_profile.ssid if selected_profile else None,
+        "selected_role": selected_profile.role if selected_profile else None,
+        "selection_reasons": selection_reasons,
+        "mode": asdict(mode),
+        "health": health,
         "prune_missing": prune_missing,
         "changes": changes,
         "warnings": warnings,
         "errors": errors,
+        "diagnostics": diagnostics_status(),
     }
     if errors:
         payload["message"] = "; ".join(errors)
+    elif selected_profile is None:
+        payload["message"] = "No upstream available."
     return UpstreamResult(response_payload(payload, verbose=True), exit_code)
+
+
+def reconnect_upstream(path: Path | None = None, *, interface: str | None = None, prune_missing: bool = False) -> UpstreamResult:
+    return apply_upstream(path=path, interface=interface, prune_missing=prune_missing, force_reconnect=True)
 
 
 def activate_upstream(ssid: str, *, interface: str | None = None) -> UpstreamResult:
@@ -846,45 +1063,27 @@ def activate_upstream(ssid: str, *, interface: str | None = None) -> UpstreamRes
     interface_name = interface or UPSTREAM_INTERFACE
     warnings: list[str] = []
     errors: list[str] = []
-
     try:
         connection_map, list_errors = _list_nmcli_wifi_connections()
     except Exception as exc:
-        payload = {
-            "status": "error",
-            "exit_code": 3,
-            "message": f"Unable to query NetworkManager: {exc}",
-            "warnings": warnings,
-        }
+        payload = {"status": "error", "exit_code": 3, "message": f"Unable to query NetworkManager: {exc}", "warnings": warnings}
         return UpstreamResult(response_payload(payload, verbose=True), 3)
-
     errors.extend(list_errors)
-
     connection_name = connection_map.get(_profile_key(cleaned_ssid), (cleaned_ssid, cleaned_ssid))[0]
-    connect_result = _safe_nmcli(
-        ["connection", "up", connection_name, "ifname", interface_name],
-        errors=errors,
-        context=f"Failed to activate {cleaned_ssid}",
-    )
+    connect_result = _safe_nmcli(["connection", "up", connection_name, "ifname", interface_name], errors=errors, context=f"Failed to activate {cleaned_ssid}")
     if connect_result is not None and connect_result.returncode != 0:
         errors.append(_nmcli_stderr(connect_result) or f"Failed to activate {cleaned_ssid}")
-
-    active_ssid, active_errors = _active_upstream_connection(interface_name)
-    errors.extend(active_errors)
-
-    status = "ok"
-    exit_code = 0
-    if errors:
-        status = "error"
-        exit_code = 3
-
+    health, _commands, health_errors = _upstream_health(interface_name)
+    errors.extend(health_errors)
+    exit_code = 3 if errors else 0
     payload = {
-        "status": status,
+        "status": "error" if errors else ("ok" if health["healthy"] else "warning"),
         "exit_code": exit_code,
         "interface": interface_name,
         "ssid": cleaned_ssid,
         "connection": connection_name,
-        "active_ssid": active_ssid,
+        "active_ssid": health.get("active_ssid"),
+        "health": health,
         "warnings": warnings,
         "errors": errors,
     }
@@ -898,84 +1097,32 @@ def forget_system_profile(ssid: str, *, interface: str | None = None) -> Upstrea
     interface_name = interface or UPSTREAM_INTERFACE
     warnings: list[str] = []
     errors: list[str] = []
-
     try:
         connection_map, list_errors = _list_nmcli_wifi_connections()
     except Exception as exc:
-        payload = {
-            "status": "error",
-            "exit_code": 3,
-            "message": f"Unable to query NetworkManager: {exc}",
-            "warnings": warnings,
-        }
+        payload = {"status": "error", "exit_code": 3, "message": f"Unable to query NetworkManager: {exc}", "warnings": warnings}
         return UpstreamResult(response_payload(payload, verbose=True), 3)
-
     errors.extend(list_errors)
-
     active_ssid, active_connection_name, active_errors = _active_upstream_details(interface_name)
     errors.extend(active_errors)
     if active_errors:
-        payload = {
-            "status": "error",
-            "exit_code": 3,
-            "message": "Unable to determine the active upstream connection; refusing to forget a system profile.",
-            "interface": interface_name,
-            "errors": errors,
-        }
+        payload = {"status": "error", "exit_code": 3, "message": "Unable to determine the active upstream connection; refusing to forget a system profile.", "interface": interface_name, "errors": errors}
         return UpstreamResult(response_payload(payload, verbose=True), 3)
-
     target_key = _profile_key(cleaned_ssid)
     connection_name, resolved_ssid = connection_map.get(target_key, ("", ""))
     if not connection_name:
-        payload = {
-            "status": "error",
-            "exit_code": 2,
-            "message": f"SSID {cleaned_ssid} was not found.",
-            "interface": interface_name,
-            "errors": errors,
-        }
+        payload = {"status": "error", "exit_code": 2, "message": f"SSID {cleaned_ssid} was not found.", "interface": interface_name, "errors": errors}
         return UpstreamResult(response_payload(payload, verbose=True), 2)
-
     active_key = _profile_key(active_ssid or "")
-    if (
-        (active_connection_name and connection_name == active_connection_name)
-        or (active_connection_name and _profile_key(active_connection_name) == target_key)
-        or (active_key and active_key == target_key)
-    ):
-        payload = {
-            "status": "error",
-            "exit_code": 2,
-            "message": f"Cannot forget active upstream connection {cleaned_ssid}.",
-            "interface": interface_name,
-            "connection": connection_name,
-            "errors": errors,
-        }
+    if (active_connection_name and connection_name == active_connection_name) or (active_key and active_key == target_key):
+        payload = {"status": "error", "exit_code": 2, "message": f"Cannot forget active upstream connection {cleaned_ssid}.", "interface": interface_name, "connection": connection_name, "errors": errors}
         return UpstreamResult(response_payload(payload, verbose=True), 2)
-
-    delete_result = _safe_nmcli(
-        ["connection", "delete", connection_name],
-        errors=errors,
-        context=f"Failed to delete {cleaned_ssid}",
-    )
+    delete_result = _safe_nmcli(["connection", "delete", connection_name], errors=errors, context=f"Failed to delete {cleaned_ssid}")
     if delete_result is None or delete_result.returncode != 0:
-        if delete_result is not None and delete_result.returncode != 0:
+        if delete_result is not None:
             errors.append(_nmcli_stderr(delete_result) or f"Failed to delete {cleaned_ssid}")
-
-    status = "ok"
-    exit_code = 0
-    if errors:
-        status = "error"
-        exit_code = 3
-
-    payload = {
-        "status": status,
-        "exit_code": exit_code,
-        "interface": interface_name,
-        "ssid": resolved_ssid or cleaned_ssid,
-        "connection": connection_name,
-        "warnings": warnings,
-        "errors": errors,
-    }
+    exit_code = 3 if errors else 0
+    payload = {"status": "error" if errors else "ok", "exit_code": exit_code, "interface": interface_name, "ssid": resolved_ssid or cleaned_ssid, "connection": connection_name, "warnings": warnings, "errors": errors}
     if errors:
         payload["message"] = "; ".join(errors)
     return UpstreamResult(response_payload(payload, verbose=True), exit_code)
@@ -986,10 +1133,7 @@ def _merge_profiles(preferred: list[DiscoveredProfile], secondary: list[Discover
     for profile in secondary:
         key = _profile_key(profile.ssid)
         existing = combined.get(key)
-        if not existing:
-            combined[key] = profile
-            continue
-        if profile.has_password and not existing.has_password:
+        if not existing or (profile.has_password and not existing.has_password):
             combined[key] = profile
     return _sorted_profiles(combined.values())
 
@@ -1000,120 +1144,85 @@ def discover_system_profiles() -> tuple[list[DiscoveredProfile], list[str], dict
     wpa_profiles, wpa_warnings, wpa_details = _parse_wpa_supplicant(UPSTREAM_WPA_SUPPLICANT_CONF)
     warnings.extend(wpa_warnings)
     details["wpa_supplicant"] = wpa_details
-
     nmcli_profiles, nmcli_warnings, nmcli_details = _parse_nmcli_wifi()
     warnings.extend(nmcli_warnings)
     details["nmcli"] = nmcli_details
-
-    merged = _merge_profiles(wpa_profiles, nmcli_profiles)
-    return merged, warnings, details
+    return _merge_profiles(wpa_profiles, nmcli_profiles), warnings, details
 
 
-def _drift_summary(
-    stored_profiles: Sequence[UpstreamProfile],
-    system_profiles: Sequence[DiscoveredProfile],
-) -> dict[str, object]:
+def _drift_summary(stored_profiles: Sequence[UpstreamProfile], system_profiles: Sequence[DiscoveredProfile]) -> dict[str, object]:
     stored_map = {_profile_key(profile.ssid): profile for profile in stored_profiles}
     system_map = {_profile_key(profile.ssid): profile for profile in system_profiles}
-
     missing_in_system = [profile.ssid for key, profile in stored_map.items() if key not in system_map]
     missing_in_storage = [profile.ssid for key, profile in system_map.items() if key not in stored_map]
-
     mismatched: list[dict[str, object]] = []
     for key, stored_profile in stored_map.items():
         system_profile = system_map.get(key)
         if not system_profile:
             continue
         if stored_profile.priority != system_profile.priority or stored_profile.security != system_profile.security:
-            mismatched.append(
-                {
-                    "ssid": stored_profile.ssid,
-                    "stored": {"priority": stored_profile.priority, "security": stored_profile.security},
-                    "system": {"priority": system_profile.priority, "security": system_profile.security},
-                }
-            )
-
-    password_gaps = [
-        profile.ssid
-        for profile in system_profiles
-        if profile.password_missing and _requires_password(profile.security)
-    ]
-
-    return {
-        "missing_in_system": missing_in_system,
-        "missing_in_storage": missing_in_storage,
-        "mismatched": mismatched,
-        "password_gaps": password_gaps,
-        "has_drift": bool(missing_in_system or missing_in_storage or mismatched or password_gaps),
-    }
+            mismatched.append({"ssid": stored_profile.ssid, "stored": {"priority": stored_profile.priority, "security": stored_profile.security, "role": stored_profile.role}, "system": {"priority": system_profile.priority, "security": system_profile.security}})
+    password_gaps = [profile.ssid for profile in system_profiles if profile.password_missing and _requires_password(profile.security)]
+    return {"missing_in_system": missing_in_system, "missing_in_storage": missing_in_storage, "mismatched": mismatched, "password_gaps": password_gaps, "has_drift": bool(missing_in_system or missing_in_storage or mismatched or password_gaps)}
 
 
-def _annotate_discovered(profiles: Sequence[DiscoveredProfile]) -> list[dict[str, object]]:
+def _annotate_discovered(profiles: Sequence[DiscoveredProfile], stored_profiles: Sequence[UpstreamProfile]) -> list[dict[str, object]]:
+    stored_map = {_profile_key(profile.ssid): profile for profile in stored_profiles}
     annotated: list[dict[str, object]] = []
     for profile in profiles:
-        annotated.append(
-            {
-                "ssid": profile.ssid,
-                "priority": profile.priority,
-                "security": profile.security,
-                "has_password": profile.has_password,
-                "password_missing": profile.password_missing,
-                "source": profile.source or "system",
-            }
-        )
+        stored_match = stored_map.get(_profile_key(profile.ssid))
+        annotated.append({
+            "ssid": profile.ssid,
+            "priority": profile.priority,
+            "security": profile.security,
+            "role": stored_match.role if stored_match else None,
+            "enabled": stored_match.enabled if stored_match else None,
+            "autoconnect": stored_match.autoconnect if stored_match else None,
+            "has_password": profile.has_password,
+            "password_missing": profile.password_missing,
+            "source": profile.source or "system",
+        })
     return annotated
 
 
-def _combine_display_profiles(
-    stored_profiles: Sequence[UpstreamProfile],
-    system_profiles: Sequence[DiscoveredProfile],
-) -> list[dict[str, object]]:
+def _combine_display_profiles(stored_profiles: Sequence[UpstreamProfile], system_profiles: Sequence[DiscoveredProfile]) -> list[dict[str, object]]:
     stored_map = {_profile_key(profile.ssid): profile for profile in stored_profiles}
     display: list[dict[str, object]] = []
-
     for profile in system_profiles:
         key = _profile_key(profile.ssid)
         stored_match = stored_map.pop(key, None)
         entry = {
             "ssid": profile.ssid,
-            "priority": profile.priority,
-            "security": profile.security,
+            "priority": stored_match.priority if stored_match else profile.priority,
+            "security": stored_match.security if stored_match else profile.security,
+            "role": stored_match.role if stored_match else None,
+            "enabled": stored_match.enabled if stored_match else True,
+            "autoconnect": stored_match.autoconnect if stored_match else True,
             "has_password": profile.has_password,
             "password_missing": profile.password_missing,
             "source": profile.source or "system",
             "saved": stored_match is not None,
-            "drift": False,
+            "drift": bool(stored_match and (stored_match.priority != profile.priority or stored_match.security != profile.security)),
         }
-        if stored_match and (
-            stored_match.priority != profile.priority or stored_match.security != profile.security
-        ):
-            entry["drift"] = True
         display.append(entry)
-
     for leftover in stored_map.values():
-        display.append(
-            {
-                "ssid": leftover.ssid,
-                "priority": leftover.priority,
-                "security": leftover.security,
-                "has_password": leftover.has_password,
-                "password_missing": False,
-                "source": "saved",
-                "saved": True,
-                "drift": True,
-            }
-        )
-
-    return sorted(
-        display,
-        key=lambda entry: (-int(entry.get("priority") or 0), str(entry.get("ssid") or "").lower()),
-    )
+        display.append({
+            "ssid": leftover.ssid,
+            "priority": leftover.priority,
+            "security": leftover.security,
+            "role": leftover.role,
+            "enabled": leftover.enabled,
+            "autoconnect": leftover.autoconnect,
+            "has_password": leftover.has_password,
+            "password_missing": False,
+            "source": "saved",
+            "saved": True,
+            "drift": True,
+        })
+    return sorted(display, key=lambda entry: (-ROLE_WEIGHTS.get(str(entry.get("role") or DEFAULT_ROLE), 0), -int(entry.get("priority") or 0), str(entry.get("ssid") or "").lower()))
 
 
-def _merge_scan_results(
-    profiles: Sequence[dict[str, object]],
-    scan_results: Mapping[str, Mapping[str, object]],
-) -> list[dict[str, object]]:
+def _merge_scan_results(profiles: Sequence[dict[str, object]], scan_results: Mapping[str, Mapping[str, object]]) -> list[dict[str, object]]:
     merged: list[dict[str, object]] = []
     for entry in profiles:
         ssid = entry.get("ssid")
@@ -1122,10 +1231,7 @@ def _merge_scan_results(
         availability = "unavailable"
         signal_strength = None
         if scan:
-            if scan.get("active"):
-                availability = "active"
-            elif scan.get("available"):
-                availability = "available"
+            availability = "active" if scan.get("active") else "available"
             signal_strength = scan.get("signal_percent")
         merged_entry = dict(entry)
         merged_entry["availability"] = availability
@@ -1136,60 +1242,68 @@ def _merge_scan_results(
 
 def status(path: Path | None = None) -> dict[str, object]:
     stored_warnings: list[str] = []
-    stored_profiles = load_profiles(path, warnings=stored_warnings)
+    stored_profiles, mode, _ = _normalized_config(path, stored_warnings)
     system_profiles, system_warnings, discovery_details = discover_system_profiles()
     system_profiles = _inject_saved_passwords(system_profiles, stored_profiles)
     drift = _drift_summary(stored_profiles, system_profiles)
     interface_name = UPSTREAM_INTERFACE
     active_ssid, active_errors = _active_upstream_connection(interface_name)
     scan_results, scan_warnings, scan_details = _scan_nmcli_wifi(interface_name, active_ssid)
-    warnings = [*stored_warnings, *system_warnings, *active_errors, *scan_warnings]
-    status_label = "ok" if not drift["has_drift"] else "warning"
-    profiles = _combine_display_profiles(stored_profiles, system_profiles)
-    profiles = _merge_scan_results(profiles, scan_results)
+    health, _, health_errors = _upstream_health(interface_name)
+    warnings = [*stored_warnings, *system_warnings, *active_errors, *scan_warnings, *health_errors]
+    profiles = _merge_scan_results(_combine_display_profiles(stored_profiles, system_profiles), scan_results)
+    selected_profile, selection_reasons = _select_profile(_sorted_profiles_with_roles(stored_profiles), mode, scan_results)
+    status_label = "ok" if not drift["has_drift"] and health["healthy"] else "warning"
     payload: dict[str, object] = {
         "status": status_label,
         "exit_code": 0,
+        "mode": asdict(mode),
         "stored_profiles": _annotate_profiles(stored_profiles),
-        "system_profiles": _annotate_discovered(system_profiles),
+        "system_profiles": _annotate_discovered(system_profiles, stored_profiles),
         "profiles": profiles,
         "drift": drift,
         "warnings": warnings,
         "discovery": {**discovery_details, "scan": scan_details},
+        "health": health,
+        "active_upstream": {"ssid": health.get("active_ssid"), "role": next((p.role for p in stored_profiles if _profile_key(p.ssid) == _profile_key(str(health.get("active_ssid") or ""))), None)},
+        "selection_preview": {"ssid": selected_profile.ssid if selected_profile else None, "role": selected_profile.role if selected_profile else None, "reasons": selection_reasons},
+        "diagnostics": diagnostics_status(),
     }
     if drift["has_drift"]:
         payload["message"] = "Upstream Wi-Fi configuration differs between saved and system state."
     if system_warnings:
         payload["message"] = "; ".join(system_warnings)
-        payload["status"] = "warning"
+    if not health["healthy"] and not payload.get("message"):
+        payload["message"] = "Upstream is not healthy."
     return payload
 
 
 def save_current_config(path: Path | None = None) -> list[dict[str, object]]:
-    stored_profiles = load_profiles(path)
+    stored_profiles, mode, _ = _normalized_config(path)
     system_profiles, warnings, _ = discover_system_profiles()
     system_profiles = _inject_saved_passwords(system_profiles, stored_profiles)
     if not system_profiles:
         raise ValueError("No upstream Wi-Fi profiles detected on the system.")
-    missing_passwords = [
-        profile.ssid for profile in system_profiles if profile.password_missing and _requires_password(profile.security)
-    ]
+    missing_passwords = [profile.ssid for profile in system_profiles if profile.password_missing and _requires_password(profile.security)]
     if missing_passwords:
-        raise ValueError(
-            "Cannot save current configuration; missing passwords for: " + ", ".join(sorted(missing_passwords))
-        )
-
+        raise ValueError("Cannot save current configuration; missing passwords for: " + ", ".join(sorted(missing_passwords)))
     storage_path = path or UPSTREAM_NETWORKS_JSON
-    upstream_profiles = [
-        UpstreamProfile(
-            ssid=profile.ssid,
-            password=profile.prepared_password,
-            priority=profile.priority,
-            security=profile.security,
+    stored_map = {_profile_key(profile.ssid): profile for profile in stored_profiles}
+    upstream_profiles = []
+    for index, profile in enumerate(system_profiles):
+        stored_match = stored_map.get(_profile_key(profile.ssid))
+        upstream_profiles.append(
+            UpstreamProfile(
+                ssid=profile.ssid,
+                password=profile.prepared_password,
+                priority=profile.priority,
+                security=profile.security,
+                role=stored_match.role if stored_match else _default_role_for_index(index),
+                enabled=True if stored_match is None else stored_match.enabled,
+                autoconnect=True if stored_match is None else stored_match.autoconnect,
+            )
         )
-        for profile in system_profiles
-    ]
-    _save_profiles(_sorted_profiles(upstream_profiles), storage_path)
+    _save_profiles(_sorted_profiles_with_roles(upstream_profiles), storage_path, mode=mode)
     if warnings:
         LOG.warning("Warnings while saving current upstream config: %s", "; ".join(warnings))
     return _annotate_profiles(upstream_profiles)
@@ -1197,19 +1311,26 @@ def save_current_config(path: Path | None = None) -> list[dict[str, object]]:
 
 __all__ = [
     "LEGACY_UPSTREAM_JSON",
+    "UPSTREAM_DIAGNOSTICS_JSON",
     "UPSTREAM_NETWORKS_JSON",
-    "UpstreamProfile",
     "DiscoveredProfile",
+    "UpstreamMode",
+    "UpstreamProfile",
     "UpstreamResult",
     "activate_upstream",
     "add_profile",
     "apply_upstream",
+    "diagnostics_status",
     "discover_system_profiles",
     "forget_system_profile",
     "list_profiles",
+    "load_mode",
     "load_profiles",
-    "save_current_config",
-    "status",
+    "reconnect_upstream",
     "remove_profile",
+    "save_current_config",
+    "set_diagnostics_enabled",
+    "status",
+    "update_mode",
     "update_profile",
 ]

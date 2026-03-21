@@ -524,12 +524,19 @@ def _write_web_config(
     )
     return result
 
+def _agent_run_command(client: AgentClient, cli_command: Sequence[str], *, env: Mapping[str, str], timeout: float | None):
+    try:
+        return client.run_command(cli_command, env=env, timeout=timeout)
+    except TypeError:
+        return client.run_command(cli_command, env=env)
+
+
 def _invoke_cli(args: Sequence[str], timeout: float | None = None) -> tuple[Mapping[str, Any], HTTPStatus]:
     base_command = _cli_base_command() + [str(part) for part in args]
     cli_command = ["bash", "-lc", shlex.join(base_command)]
     try:
         client = _agent_client(timeout=timeout)
-        result = client.run_command(cli_command, env=_cli_env(), timeout=timeout)
+        result = _agent_run_command(client, cli_command, env=_cli_env(), timeout=timeout)
     except AgentError as exc:
         detail = getattr(exc, "detail", {})
         if isinstance(detail, Mapping) and detail.get("timeout") is True:
@@ -1058,6 +1065,17 @@ def _is_privilege_error(exc: Exception) -> bool:
     return False
 
 
+
+def _invoke_runner_callable(
+    runner: Callable[[Sequence[str], float | None], tuple[Mapping[str, Any], HTTPStatus]],
+    args: list[str],
+    timeout: float | None,
+):
+    try:
+        return runner(args, timeout)
+    except TypeError:
+        return runner(args)
+
 def _call_runner(
     runner: Callable[[Sequence[str], float | None], tuple[Mapping[str, Any], HTTPStatus]],
     args: list[str],
@@ -1066,7 +1084,7 @@ def _call_runner(
     timeout: float | None = None,
 ) -> tuple[tuple[Mapping[str, Any], HTTPStatus] | None, tuple[Any, HTTPStatus] | None]:
     try:
-        return runner(args, timeout), None
+        return _invoke_runner_callable(runner, args, timeout), None
     except BadRequest:
         raise
     except Exception as exc:  # pragma: no cover - routed through _runner_error_response
@@ -1076,7 +1094,7 @@ def _call_runner(
         )
         if fallback_allowed:
             try:
-                return fallback_runner(args, timeout), None
+                return _invoke_runner_callable(fallback_runner, args, timeout), None
             except BadRequest:
                 raise
             except Exception as fallback_exc:  # pragma: no cover - routed through _runner_error_response
@@ -1348,8 +1366,19 @@ def create_app(
         password = body.get("password", "")
         if not isinstance(password, str):
             raise BadRequest("password must be a string.")
+        role = _coerce_str(body.get("role"), "role") if "role" in body else upstream.DEFAULT_ROLE
+        enabled = _coerce_bool(body.get("enabled"), "enabled", default=True)
+        autoconnect = _coerce_bool(body.get("autoconnect"), "autoconnect", default=True)
         return _wifi_response(
-            lambda: upstream.add_profile(ssid=ssid, password=password, priority=priority, security=security)
+            lambda: upstream.add_profile(
+                ssid=ssid,
+                password=password,
+                priority=priority,
+                security=security,
+                role=role,
+                enabled=enabled,
+                autoconnect=autoconnect,
+            )
         )
 
     @app.patch("/upstream/profiles")
@@ -1359,17 +1388,49 @@ def create_app(
         priority = _coerce_positive_int(body.get("priority"), "priority", default=None)
         security = _coerce_str(body.get("security"), "security") if "security" in body else None
         password = body.get("password") if "password" in body else None
+        role = _coerce_str(body.get("role"), "role") if "role" in body else None
+        enabled = _coerce_bool(body.get("enabled"), "enabled", default=None) if "enabled" in body else None
+        autoconnect = _coerce_bool(body.get("autoconnect"), "autoconnect", default=None) if "autoconnect" in body else None
         if password is not None and not isinstance(password, str):
             raise BadRequest("password must be a string.")
         return _wifi_response(
-            lambda: upstream.update_profile(ssid=ssid, password=password, priority=priority, security=security)
+            lambda: upstream.update_profile(
+                ssid=ssid,
+                password=password,
+                priority=priority,
+                security=security,
+                role=role,
+                enabled=enabled,
+                autoconnect=autoconnect,
+            )
         )
 
     @app.delete("/upstream/profiles")
     def upstream_profiles_delete():
         body = _json_body()
         ssid = _coerce_str(body.get("ssid"), "ssid", required=True)
-        return _wifi_response(lambda: upstream.remove_profile(ssid=ssid))
+        force = _coerce_bool(body.get("force"), "force", default=False)
+        return _wifi_response(lambda: upstream.remove_profile(ssid=ssid, force=bool(force)))
+
+    @app.get("/upstream/diagnostics")
+    def upstream_diagnostics_show():
+        return _dispatch_runner(["upstream", "diagnostics", "show"])
+
+    @app.post("/upstream/diagnostics")
+    def upstream_diagnostics_toggle():
+        body = _json_body()
+        enabled = _coerce_bool(body.get("enabled"), "enabled", default=None)
+        if enabled is None:
+            raise BadRequest("enabled is required.")
+        return _dispatch_runner(["upstream", "diagnostics", "enable" if enabled else "disable"])
+
+    @app.post("/upstream/mode")
+    def upstream_mode_toggle():
+        body = _json_body()
+        prefer_recovery = _coerce_bool(body.get("prefer_recovery"), "prefer_recovery", default=None)
+        if prefer_recovery is None:
+            raise BadRequest("prefer_recovery is required.")
+        return _dispatch_runner(["upstream", "prefer-recovery", "enable" if prefer_recovery else "disable"])
 
     @app.post("/upstream/system/forget")
     def upstream_system_forget():
@@ -1410,6 +1471,22 @@ def create_app(
             return _error_response("Upstream apply job not found.", HTTPStatus.NOT_FOUND)
         return jsonify(_job_payload(job)), HTTPStatus.OK
 
+    @app.post("/upstream/reconnect")
+    def upstream_reconnect():
+        body = request.get_json(silent=True)
+        if body is None:
+            body = {}
+        if not isinstance(body, Mapping):
+            raise BadRequest("JSON body must be an object.")
+        timeout = None
+        if "timeout" in body:
+            timeout = _coerce_positive_float(body.get("timeout"), "timeout")
+        if timeout is None:
+            timeout = config.agent_timeout
+        args = ["upstream", "reconnect"]
+        _add_flag(args, "--prune-missing", _coerce_bool(body.get("prune_missing"), "prune_missing", default=False))
+        return _dispatch_runner(args, timeout=timeout)
+
     @app.post("/upstream/activate")
     def upstream_activate():
         body = _json_body()
@@ -1438,8 +1515,14 @@ def create_app(
         _add_option(args, "--password", _coerce_str(body.get("password"), "password"))
         _add_option(args, "--octet", subnet_octet)
         _add_option(args, "--channel", channel)
-        _add_option(args, "--target", _coerce_str(body.get("target"), "target", required=True))
+        _add_option(args, "--target", _coerce_str(body.get("target"), "target"))
         _add_option(args, "--redirect", _coerce_str(body.get("redirect"), "redirect"))
+        _add_option(args, "--recovery-ssid", _coerce_str(body.get("recovery_ssid"), "recovery_ssid"))
+        _add_option(args, "--recovery-password", _coerce_str(body.get("recovery_password"), "recovery_password"))
+        _add_option(args, "--primary-ssid", _coerce_str(body.get("primary_ssid"), "primary_ssid"))
+        _add_option(args, "--primary-password", _coerce_str(body.get("primary_password"), "primary_password"))
+        _add_option(args, "--secondary-ssid", _coerce_str(body.get("secondary_ssid"), "secondary_ssid"))
+        _add_option(args, "--secondary-password", _coerce_str(body.get("secondary_password"), "secondary_password"))
         _add_flag(args, "--force", _coerce_bool(body.get("force"), "force", default=False))
         force_restart = _coerce_bool(body.get("force_restart"), "force_restart", default=True)
         if force_restart is False:
