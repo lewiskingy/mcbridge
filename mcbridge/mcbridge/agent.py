@@ -486,16 +486,130 @@ def _domain_ap_update(command: Sequence[str], *, text_mode: bool) -> Mapping[str
     }
 
 
+def _domain_upstream_status(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
+    from . import upstream
+
+    payload = upstream.status()
+    return {
+        "status": "ok",
+        "returncode": int(payload.get("exit_code", 0) or 0),
+        "stdout": _serialize_payload(payload, text_mode=text_mode),
+        "stderr": "",
+    }
+
+
+def _domain_upstream_update(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
+    from . import upstream
+
+    parser = _ArgumentParser(prog="mcbridge upstream update", add_help=False)
+    parser.add_argument("--ssid", required=True)
+    parser.add_argument("--password")
+    parser.add_argument("--priority", type=int)
+    parser.add_argument("--security")
+    parser.add_argument("--role")
+    parser.add_argument("--enabled", dest="enabled", action="store_true")
+    parser.add_argument("--disabled", dest="enabled", action="store_false")
+    parser.add_argument("--autoconnect", dest="autoconnect", action="store_true")
+    parser.add_argument("--no-autoconnect", dest="autoconnect", action="store_false")
+    parser.set_defaults(enabled=None, autoconnect=None)
+    try:
+        parsed = parser.parse_args(command[3:])
+    except ValueError as exc:
+        return {"status": "ok", "returncode": 2, "stdout": "", "stderr": str(exc)}
+
+    existing = {entry["ssid"].lower(): entry for entry in upstream.list_profiles()}
+    if parsed.ssid.strip().lower() in existing:
+        profiles = upstream.update_profile(
+            ssid=parsed.ssid,
+            password=parsed.password,
+            priority=parsed.priority,
+            security=parsed.security,
+            role=parsed.role,
+            enabled=parsed.enabled,
+            autoconnect=parsed.autoconnect,
+        )
+    else:
+        if parsed.priority is None or parsed.security is None:
+            return {"status": "ok", "returncode": 2, "stdout": "", "stderr": "priority and security are required for new upstream profiles"}
+        profiles = upstream.add_profile(
+            ssid=parsed.ssid,
+            password=parsed.password or "",
+            priority=parsed.priority,
+            security=parsed.security,
+            role=parsed.role or upstream.DEFAULT_ROLE,
+            enabled=True if parsed.enabled is None else parsed.enabled,
+            autoconnect=True if parsed.autoconnect is None else parsed.autoconnect,
+        )
+    payload = {"status": "ok", "exit_code": 0, "profiles": profiles}
+    return {"status": "ok", "returncode": 0, "stdout": _serialize_payload(payload, text_mode=text_mode), "stderr": ""}
+
+
 def _domain_upstream_apply(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
     from . import upstream
 
-    result = upstream.apply_upstream()
+    parser = _ArgumentParser(prog="mcbridge upstream apply", add_help=False)
+    parser.add_argument("--prune-missing", action="store_true")
+    try:
+        parsed = parser.parse_args(command[3:])
+    except ValueError as exc:
+        return {"status": "ok", "returncode": 2, "stdout": "", "stderr": str(exc)}
+
+    result = upstream.apply_upstream(prune_missing=parsed.prune_missing)
     return {
         "status": "ok",
         "returncode": result.exit_code,
         "stdout": _serialize_payload(result.payload, text_mode=text_mode),
         "stderr": "",
     }
+
+
+def _domain_upstream_reconnect(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
+    from . import upstream
+
+    parser = _ArgumentParser(prog="mcbridge upstream reconnect", add_help=False)
+    parser.add_argument("--prune-missing", action="store_true")
+    try:
+        parsed = parser.parse_args(command[3:])
+    except ValueError as exc:
+        return {"status": "ok", "returncode": 2, "stdout": "", "stderr": str(exc)}
+
+    result = upstream.reconnect_upstream(prune_missing=parsed.prune_missing)
+    return {
+        "status": "ok",
+        "returncode": result.exit_code,
+        "stdout": _serialize_payload(result.payload, text_mode=text_mode),
+        "stderr": "",
+    }
+
+
+def _domain_upstream_diagnostics(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
+    from . import upstream
+
+    action = command[3] if len(command) > 3 else ""
+    if action == "enable":
+        result = upstream.set_diagnostics_enabled(True)
+        payload = result.payload
+        code = result.exit_code
+    elif action == "disable":
+        result = upstream.set_diagnostics_enabled(False)
+        payload = result.payload
+        code = result.exit_code
+    elif action == "show":
+        payload = upstream.diagnostics_status()
+        code = int(payload.get("exit_code", 0) or 0)
+    else:
+        return {"status": "ok", "returncode": 2, "stdout": "", "stderr": "diagnostics action must be enable, disable, or show"}
+    return {"status": "ok", "returncode": code, "stdout": _serialize_payload(payload, text_mode=text_mode), "stderr": ""}
+
+
+def _domain_upstream_prefer_recovery(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:
+    from . import upstream
+
+    state = command[3] if len(command) > 3 else ""
+    if state not in {"enable", "disable"}:
+        return {"status": "ok", "returncode": 2, "stdout": "", "stderr": "state must be enable or disable"}
+    payload = {"status": "ok", "exit_code": 0, "mode": upstream.update_mode(prefer_recovery=state == "enable")}
+    return {"status": "ok", "returncode": 0, "stdout": _serialize_payload(payload, text_mode=text_mode), "stderr": ""}
 
 
 def _domain_upstream_activate(command: Sequence[str], *, text_mode: bool) -> Mapping[str, Any]:

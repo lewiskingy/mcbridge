@@ -11,6 +11,8 @@ const upstreamState = {
   storedProfiles: [],
   systemProfiles: [],
   drift: null,
+  mode: { prefer_recovery: false, diagnostics_enabled: false },
+  diagnostics: null,
   selectedSsid: null,
   selectedIsSaved: false,
   loading: false,
@@ -73,7 +75,17 @@ function cacheDashboardElements() {
     upstreamPasswordInput: document.getElementById("upstreamPasswordInput"),
     upstreamPasswordToggle: document.getElementById("upstreamPasswordToggle"),
     upstreamPriorityInput: document.getElementById("upstreamPriorityInput"),
+    upstreamRoleSelect: document.getElementById("upstreamRoleSelect"),
+    upstreamEnabledInput: document.getElementById("upstreamEnabledInput"),
+    upstreamAutoconnectInput: document.getElementById("upstreamAutoconnectInput"),
     upstreamSecuritySelect: document.getElementById("upstreamSecuritySelect"),
+    preferRecoveryInput: document.getElementById("preferRecoveryInput"),
+    upstreamDiagnosticsInput: document.getElementById("upstreamDiagnosticsInput"),
+    saveUpstreamModeBtn: document.getElementById("saveUpstreamModeBtn"),
+    refreshUpstreamDiagnosticsBtn: document.getElementById("refreshUpstreamDiagnosticsBtn"),
+    reconnectUpstreamBtn: document.getElementById("reconnectUpstreamBtn"),
+    upstreamDiagnosticsView: document.getElementById("upstreamDiagnosticsView"),
+    upstreamDiagnosticsSummary: document.getElementById("upstreamDiagnosticsSummary"),
     refreshUpstreamBtn: document.getElementById("refreshUpstreamBtn"),
     saveUpstreamBtn: document.getElementById("saveUpstreamBtn"),
     resetUpstreamBtn: document.getElementById("resetUpstreamBtn"),
@@ -525,16 +537,22 @@ function updateSaveCurrentButton() {
 
 function renderUpstreamStatus(payload) {
   const { upstreamStatus } = dashboardElements;
-  const statusValue = payload?.status || "unknown";
-  setStateText(upstreamStatus, statusValue, statusValue);
-  upstreamState.statusText = statusValue;
+  const statusValue = payload?.health?.healthy ? "ok" : payload?.status || "unknown";
+  const activeLabel = payload?.active_upstream?.ssid ? `Active: ${payload.active_upstream.ssid}` : statusValue;
+  setStateText(upstreamStatus, activeLabel, statusValue);
+  upstreamState.statusText = activeLabel;
   upstreamState.statusValue = statusValue;
   upstreamState.profiles = Array.isArray(payload?.profiles) ? payload.profiles : [];
   upstreamState.storedProfiles = Array.isArray(payload?.stored_profiles) ? payload.stored_profiles : [];
   upstreamState.systemProfiles = Array.isArray(payload?.system_profiles) ? payload.system_profiles : [];
   upstreamState.drift = payload?.drift || null;
+  upstreamState.mode = payload?.mode || { prefer_recovery: false, diagnostics_enabled: false };
+  upstreamState.diagnostics = payload?.diagnostics || null;
+  if (dashboardElements.preferRecoveryInput) dashboardElements.preferRecoveryInput.checked = !!upstreamState.mode.prefer_recovery;
+  if (dashboardElements.upstreamDiagnosticsInput) dashboardElements.upstreamDiagnosticsInput.checked = !!upstreamState.mode.diagnostics_enabled;
   renderUpstreamProfiles(upstreamState.profiles);
   renderUpstreamDrift(payload?.drift, payload?.message, payload?.warnings);
+  renderUpstreamDiagnostics(payload?.diagnostics);
   updateSaveCurrentButton();
 }
 
@@ -547,7 +565,7 @@ function renderUpstreamProfiles(profiles) {
   if (!entries.length) {
     const emptyRow = document.createElement("tr");
     const emptyCell = document.createElement("td");
-    emptyCell.colSpan = 7;
+    emptyCell.colSpan = 5;
     emptyCell.className = "muted";
     emptyCell.textContent = "No upstream networks detected. Refresh or add a network.";
     emptyRow.appendChild(emptyCell);
@@ -573,48 +591,18 @@ function renderUpstreamProfiles(profiles) {
     const securityCell = document.createElement("td");
     securityCell.textContent = profile?.security || "—";
 
-    const availabilityCell = document.createElement("td");
     const availabilityKey = normalizeTextValue(profile?.availability).toLowerCase();
-    const availabilityBadge = document.createElement("span");
-    availabilityBadge.className = "availability";
-    if (availabilityKey) {
-      availabilityBadge.classList.add(`availability--${availabilityKey}`);
-    }
-    availabilityBadge.textContent = availabilityLabels[availabilityKey] || "—";
-    availabilityCell.appendChild(availabilityBadge);
-
-    const signalCell = document.createElement("td");
     const rawSignal = profile?.signal_strength;
     const signalValue = Number.isFinite(rawSignal) ? rawSignal : parseFloat(rawSignal);
-    if (!Number.isFinite(signalValue)) {
-      signalCell.textContent = "—";
-    } else {
-      const clampedSignal = Math.max(0, Math.min(100, signalValue));
-      const signalWrap = document.createElement("div");
-      signalWrap.className = "signal-meter";
-      const signalFill = document.createElement("div");
-      signalFill.className = "signal-meter__fill";
-      if (clampedSignal < 34) {
-        signalFill.classList.add("signal-meter__fill--low");
-      } else if (clampedSignal < 67) {
-        signalFill.classList.add("signal-meter__fill--medium");
-      } else {
-        signalFill.classList.add("signal-meter__fill--high");
-      }
-      signalFill.style.width = `${Math.round(clampedSignal)}%`;
-      signalFill.setAttribute("aria-label", `Signal strength ${Math.round(clampedSignal)}%`);
-      const signalText = document.createElement("span");
-      signalText.className = "signal-meter__label";
-      signalText.textContent = `${Math.round(clampedSignal)}%`;
-      signalWrap.appendChild(signalFill);
-      signalWrap.appendChild(signalText);
-      signalCell.appendChild(signalWrap);
-    }
 
     const stateCell = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = "badge";
     let badgeText = profile?.saved ? "Saved" : "System";
+    const stateBits = [];
+    if (profile?.role) stateBits.push(profile.role);
+    if (availabilityKey) stateBits.push(availabilityLabels[availabilityKey] || availabilityKey);
+    if (Number.isFinite(signalValue)) stateBits.push(`${Math.round(signalValue)}%`);
     if (profile?.source && !profile?.saved) {
       badgeText = profile.source;
     }
@@ -628,6 +616,12 @@ function renderUpstreamProfiles(profiles) {
     }
     badge.textContent = badgeText;
     stateCell.appendChild(badge);
+    if (stateBits.length) {
+      const summary = document.createElement("div");
+      summary.className = "muted small";
+      summary.textContent = stateBits.join(" • ");
+      stateCell.appendChild(summary);
+    }
 
     const actionsCell = document.createElement("td");
     actionsCell.className = "table-actions";
@@ -671,8 +665,6 @@ function renderUpstreamProfiles(profiles) {
     row.appendChild(ssidCell);
     row.appendChild(priorityCell);
     row.appendChild(securityCell);
-    row.appendChild(availabilityCell);
-    row.appendChild(signalCell);
     row.appendChild(stateCell);
     row.appendChild(actionsCell);
     upstreamProfilesBody.appendChild(row);
@@ -684,6 +676,9 @@ function setUpstreamSelection(profile) {
     upstreamSsidInput,
     upstreamPasswordInput,
     upstreamPriorityInput,
+    upstreamRoleSelect,
+    upstreamEnabledInput,
+    upstreamAutoconnectInput,
     upstreamSecuritySelect,
     saveUpstreamBtn,
     deleteUpstreamBtn,
@@ -697,6 +692,9 @@ function setUpstreamSelection(profile) {
   }
   if (upstreamPasswordInput) upstreamPasswordInput.value = "";
   if (upstreamPriorityInput) upstreamPriorityInput.value = profile?.priority ?? "";
+  if (upstreamRoleSelect) upstreamRoleSelect.value = profile?.role || "secondary";
+  if (upstreamEnabledInput) upstreamEnabledInput.checked = profile?.enabled !== false;
+  if (upstreamAutoconnectInput) upstreamAutoconnectInput.checked = profile?.autoconnect !== false;
   if (upstreamSecuritySelect) upstreamSecuritySelect.value = profile?.security || "wpa2";
   syncUpstreamPasswordMode();
   if (saveUpstreamBtn) {
@@ -714,9 +712,12 @@ function setUpstreamSelection(profile) {
 function resetUpstreamForm() {
   setUpstreamSelection(null);
   setUpstreamError("");
-  const { upstreamPasswordInput, upstreamPriorityInput } = dashboardElements;
+  const { upstreamPasswordInput, upstreamPriorityInput, upstreamRoleSelect, upstreamEnabledInput, upstreamAutoconnectInput } = dashboardElements;
   if (upstreamPasswordInput) upstreamPasswordInput.value = "";
   if (upstreamPriorityInput) upstreamPriorityInput.value = "";
+  if (upstreamRoleSelect) upstreamRoleSelect.value = "secondary";
+  if (upstreamEnabledInput) upstreamEnabledInput.checked = true;
+  if (upstreamAutoconnectInput) upstreamAutoconnectInput.checked = true;
   syncUpstreamPasswordMode();
 }
 
@@ -737,8 +738,15 @@ function parseRequiredPriority(input) {
 }
 
 function getUpstreamFormPayload() {
-  const { upstreamSsidInput, upstreamPasswordInput, upstreamPriorityInput, upstreamSecuritySelect } =
-    dashboardElements;
+  const {
+    upstreamSsidInput,
+    upstreamPasswordInput,
+    upstreamPriorityInput,
+    upstreamRoleSelect,
+    upstreamEnabledInput,
+    upstreamAutoconnectInput,
+    upstreamSecuritySelect,
+  } = dashboardElements;
   const ssid = normalizeTextValue(upstreamSsidInput?.value);
   if (!ssid) {
     throw new Error("SSID is required.");
@@ -748,7 +756,13 @@ function getUpstreamFormPayload() {
   const password = upstreamPasswordInput?.value ?? "";
   const priority = parseRequiredPriority(upstreamPriorityInput);
 
-  return { ssid, password, priority: Number(priority), security };
+  if (security !== "open" && password && password.length < 8) {
+    throw new Error("PSK must be 64 hex characters.");
+  }
+  const role = normalizeTextValue(upstreamRoleSelect?.value) || "secondary";
+  const enabled = !!upstreamEnabledInput?.checked;
+  const autoconnect = !!upstreamAutoconnectInput?.checked;
+  return { ssid, password, priority: Number(priority), security, role, enabled, autoconnect };
 }
 
 function setUpstreamBusy(isBusy, message) {
@@ -758,7 +772,12 @@ function setUpstreamBusy(isBusy, message) {
     upstreamPasswordInput,
     upstreamPasswordToggle,
     upstreamPriorityInput,
+    upstreamRoleSelect,
+    upstreamEnabledInput,
+    upstreamAutoconnectInput,
     upstreamSecuritySelect,
+    preferRecoveryInput,
+    upstreamDiagnosticsInput,
     refreshUpstreamBtn,
     saveUpstreamBtn,
     resetUpstreamBtn,
@@ -793,12 +812,20 @@ function setUpstreamBusy(isBusy, message) {
     upstreamPasswordInput,
     upstreamPasswordToggle,
     upstreamPriorityInput,
+    upstreamRoleSelect,
+    upstreamEnabledInput,
+    upstreamAutoconnectInput,
     upstreamSecuritySelect,
+    preferRecoveryInput,
+    upstreamDiagnosticsInput,
     refreshUpstreamBtn,
     saveUpstreamBtn,
     resetUpstreamBtn,
     deleteUpstreamBtn,
     saveCurrentUpstreamBtn,
+    saveUpstreamModeBtn,
+    refreshUpstreamDiagnosticsBtn,
+    reconnectUpstreamBtn,
   ].forEach((el) => {
     if (el) el.disabled = busy;
   });
@@ -811,6 +838,89 @@ function setUpstreamBusy(isBusy, message) {
 
   if (!busy) {
     renderUpstreamProfiles(upstreamState.profiles);
+  }
+}
+
+
+function renderUpstreamDiagnostics(diagnostics) {
+  const { upstreamDiagnosticsView, upstreamDiagnosticsSummary } = dashboardElements;
+  if (upstreamDiagnosticsSummary) {
+    const lastAttempt = diagnostics?.attempts?.length ? diagnostics.attempts[diagnostics.attempts.length - 1] : null;
+    const summary = lastAttempt ? `Last attempt: ${lastAttempt.timestamp || "unknown"} → ${lastAttempt.selected_profile || "none"}` : "No diagnostics captured yet.";
+    upstreamDiagnosticsSummary.textContent = summary;
+    upstreamDiagnosticsSummary.hidden = false;
+  }
+  if (!upstreamDiagnosticsView) return;
+  const attempts = Array.isArray(diagnostics?.attempts) ? diagnostics.attempts : [];
+  upstreamDiagnosticsView.hidden = false;
+  upstreamDiagnosticsView.textContent = attempts.length ? JSON.stringify(attempts.slice(-5), null, 2) : "No diagnostics captured yet.";
+}
+
+async function saveUpstreamMode() {
+  if (upstreamState.loading) return;
+  setUpstreamBusy(true, "Saving upstream mode…");
+  setUpstreamError("");
+  try {
+    const preferRecovery = !!dashboardElements.preferRecoveryInput?.checked;
+    const diagnosticsEnabled = !!dashboardElements.upstreamDiagnosticsInput?.checked;
+    const modeRes = await fetch("/upstream/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prefer_recovery: preferRecovery }),
+    });
+    const modePayload = await modeRes.json().catch(() => ({}));
+    showOutput(modePayload);
+    if (!modeRes.ok || modePayload?.status === "error") {
+      throw new Error(buildUpstreamErrorMessage(modePayload, "Failed to save upstream mode."));
+    }
+    const diagRes = await fetch("/upstream/diagnostics", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: diagnosticsEnabled }),
+    });
+    const diagPayload = await diagRes.json().catch(() => ({}));
+    showOutput(diagPayload);
+    if (!diagRes.ok || diagPayload?.status === "error") {
+      throw new Error(buildUpstreamErrorMessage(diagPayload, "Failed to save diagnostics mode."));
+    }
+    await fetchUpstreamStatus();
+  } catch (err) {
+    setUpstreamError(`Unable to save upstream mode: ${err}`);
+  } finally {
+    setUpstreamBusy(false);
+  }
+}
+
+async function reconnectUpstream() {
+  if (upstreamState.loading) return;
+  setUpstreamBusy(true, "Reconnecting upstream…");
+  setUpstreamError("");
+  try {
+    const res = await fetch("/upstream/reconnect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+    const payload = await res.json().catch(() => ({}));
+    showOutput(payload);
+    if (!res.ok || payload?.status === "error") {
+      throw new Error(buildUpstreamErrorMessage(payload, "Failed to reconnect upstream."));
+    }
+    await fetchUpstreamStatus();
+  } catch (err) {
+    setUpstreamError(`Unable to reconnect upstream: ${err}`);
+  } finally {
+    setUpstreamBusy(false);
+  }
+}
+
+async function refreshUpstreamDiagnostics() {
+  try {
+    const res = await fetch("/upstream/diagnostics");
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok || payload?.status === "error") {
+      throw new Error(buildUpstreamErrorMessage(payload, "Failed to load diagnostics."));
+    }
+    upstreamState.diagnostics = payload;
+    renderUpstreamDiagnostics(payload);
+  } catch (err) {
+    setUpstreamError(`Unable to load diagnostics: ${err}`);
   }
 }
 
@@ -1335,6 +1445,9 @@ function bindEvents() {
   });
   refreshKnownServersBtn?.addEventListener("click", () => fetchKnownServers(true));
   refreshUpstreamBtn?.addEventListener("click", () => fetchUpstreamStatus());
+  reconnectUpstreamBtn?.addEventListener("click", () => reconnectUpstream());
+  saveUpstreamModeBtn?.addEventListener("click", () => saveUpstreamMode());
+  refreshUpstreamDiagnosticsBtn?.addEventListener("click", () => refreshUpstreamDiagnostics());
   dnsKnownServers?.addEventListener("change", handleKnownServerChange);
   apForm?.addEventListener("submit", submitAp);
   dnsForm?.addEventListener("submit", submitDns);

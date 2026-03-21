@@ -118,12 +118,14 @@
         <span class="label">Status</span>
         <div class="value state" id="upstreamStatus">Loading…</div>
         <button type="button" id="refreshUpstreamBtn">Refresh</button>
+        <button type="button" class="secondary" id="reconnectUpstreamBtn">Reconnect</button>
         <button type="button" class="secondary" id="saveCurrentUpstreamBtn" disabled>Save current config</button>
       </div>
     </div>
 
     <div class="status-detail warning" id="upstreamError" hidden></div>
     <div class="status-detail" id="upstreamDrift" hidden></div>
+    <div class="status-detail" id="upstreamDiagnosticsSummary" hidden></div>
 
     <div class="upstream-grid">
       <div class="scroll-area">
@@ -133,15 +135,13 @@
               <th>SSID</th>
               <th>Priority</th>
               <th>Security</th>
-              <th>Availability</th>
-              <th>Signal</th>
               <th>State</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody id="upstreamProfilesBody">
             <tr>
-              <td colspan="7" class="muted">Loading…</td>
+              <td colspan="5" class="muted">Loading…</td>
             </tr>
           </tbody>
         </table>
@@ -153,6 +153,14 @@
           <input id="upstreamSsidInput" type="text" name="upstream_ssid" placeholder="Home Wi-Fi">
         </label>
         <div class="form-grid">
+          <label class="form-field">
+            <span class="label">Role</span>
+            <select id="upstreamRoleSelect" name="upstream_role">
+              <option value="recovery">Recovery</option>
+              <option value="primary">Primary</option>
+              <option value="secondary">Secondary</option>
+            </select>
+          </label>
           <label class="form-field">
             <span class="label">Security</span>
             <select id="upstreamSecuritySelect" name="upstream_security">
@@ -179,7 +187,27 @@
             <input id="upstreamPriorityInput" type="number" min="1" name="priority" placeholder="10">
             <p class="muted note">Higher priority networks will be tried first.</p>
           </label>
+          <label class="form-field">
+            <span class="label">Profile options</span>
+            <span><input id="upstreamEnabledInput" type="checkbox" checked> Enabled</span>
+            <span><input id="upstreamAutoconnectInput" type="checkbox" checked> Autoconnect</span>
+          </label>
         </div>
+        <div class="form-grid">
+          <label class="form-field">
+            <span class="label">Connectivity mode</span>
+            <span><input id="preferRecoveryInput" type="checkbox"> Prefer recovery</span>
+            <span><input id="upstreamDiagnosticsInput" type="checkbox"> Diagnostics enabled</span>
+          </label>
+          <div class="form-field">
+            <span class="label">Diagnostics</span>
+            <div class="actions">
+              <button type="button" class="secondary" id="saveUpstreamModeBtn">Save mode</button>
+              <button type="button" class="secondary" id="refreshUpstreamDiagnosticsBtn">Refresh diagnostics</button>
+            </div>
+          </div>
+        </div>
+        <div class="status-detail" id="upstreamDiagnosticsView" hidden></div>
         <div class="actions end">
           <button type="button" class="secondary" id="resetUpstreamBtn">Reset</button>
           <button type="button" class="secondary danger" id="deleteUpstreamBtn" disabled>Delete</button>
