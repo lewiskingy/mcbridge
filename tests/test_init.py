@@ -212,10 +212,10 @@ def test_provision_invocation_uses_explicit_args(init_modules, monkeypatch: pyte
     script_path.chmod(0o755)
     monkeypatch.setattr(init, "_extract_provision_script", lambda: script_path)
 
-    captured: dict[str, object] = {}
+    captured: list[list[str]] = []
 
     def fake_run(command, check, capture_output, text, env):
-        captured["command"] = command
+        captured.append(list(command))
         return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(init.subprocess, "run", fake_run)
@@ -236,14 +236,12 @@ def test_provision_invocation_uses_explicit_args(init_modules, monkeypatch: pyte
     )
 
     assert result.exit_code == 0
-    command = captured.get("command")
-    assert command is not None
-    assert str(script_path) == command[0]
-    assert command[command.index("--ap-interface") + 1] == init.AP_INTERFACE
-    assert command[command.index("--upstream-interface") + 1] == init.UPSTREAM_INTERFACE
-    assert command[command.index("--ap-ip-cidr") + 1] == "192.168.77.1/24"
-    assert command[command.index("--sysctl-conf-path") + 1] == str(init.SYSCTL_CONF_PATH)
-    assert command[command.index("--iptables-rules-path") + 1] == str(init.IPTABLES_RULES_V4)
+    provision_command = next(command for command in captured if command and command[0] == str(script_path))
+    assert provision_command[provision_command.index("--ap-interface") + 1] == init.AP_INTERFACE
+    assert provision_command[provision_command.index("--upstream-interface") + 1] == init.UPSTREAM_INTERFACE
+    assert provision_command[provision_command.index("--ap-ip-cidr") + 1] == "192.168.77.1/24"
+    assert provision_command[provision_command.index("--sysctl-conf-path") + 1] == str(init.SYSCTL_CONF_PATH)
+    assert provision_command[provision_command.index("--iptables-rules-path") + 1] == str(init.IPTABLES_RULES_V4)
 
 
 def test_init_requires_root_and_skips_provision(init_modules, monkeypatch: pytest.MonkeyPatch):

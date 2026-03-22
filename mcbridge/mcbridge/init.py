@@ -2309,16 +2309,8 @@ def run(
         else:
             payload_sections.append({"dns_update": {"skipped": True, "reason": "no_redirect_target"}})
 
-        upstream_networks_path = CONFIG_DIR / "upstream_networks.json"
-        upstream_config = load_json(upstream_networks_path, default={}) if upstream_networks_path.exists() else {}
-        has_upstream_profiles = bool(
-            isinstance(upstream_config, Mapping) and (upstream_config.get("profiles") or [])
-        )
-        if has_upstream_profiles:
-            upstream_dns_result = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
-            payload_sections.append({"upstream_dns_refresh": upstream_dns_result.payload})
-        else:
-            payload_sections.append({"upstream_dns_refresh": {"skipped": True, "reason": "no_upstream_profiles"}})
+        upstream_dns_result = upstream_dns.refresh_upstream_dns(interface=UPSTREAM_INTERFACE)
+        payload_sections.append({"upstream_dns_refresh": upstream_dns_result.payload})
 
         ap_result = ap.update(
             ssid=ssid,
